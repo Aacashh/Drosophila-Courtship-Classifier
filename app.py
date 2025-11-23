@@ -66,7 +66,7 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
         summary = []
         for beh, bouts_list in bouts_by_behavior.items():
             for fly_idx, bouts in enumerate(bouts_list):
-                duration = sum(e - s for s, e in bouts) / fps
+                duration = sum((e - s + 1) for s, e in bouts) / fps
                 summary.append({
                     'Chamber': i,
                     'Fly': fly_idx,

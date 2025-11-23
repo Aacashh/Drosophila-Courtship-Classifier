@@ -67,14 +67,15 @@ def crop_video(src: Path, dst: Path, roi: Tuple[int,int,int,int]) -> None:
         .run(quiet=True)
     )
 
-def detect_chambers(frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+def detect_chambers(frame: np.ndarray, padding: int = 15) -> List[Tuple[int, int, int, int]]:
     """
     Robust chamber detection designed for 4x3 grid (12 chambers).
     Uses morphological closing to bridge split chambers (tape) without merging columns.
+    Adds 'padding' pixels to each side of the detected chamber to ensure corners are safe.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape[:2]
-    img_area = h * w
+    h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
     
     # 1. Pre-process
     # Blur to reduce noise
@@ -107,6 +108,12 @@ def detect_chambers(frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
             continue
             
         x, y, rw, rh = cv2.boundingRect(c)
+        
+        # Apply Padding safely
+        x = max(0, x - padding)
+        y = max(0, y - padding)
+        rw = min(w_img - x, rw + 2 * padding)
+        rh = min(h_img - y, rh + 2 * padding)
         
         # Aspect Ratio Filter: Chambers are roughly squares or slightly tall rectangles
         # 0.5 to 1.5

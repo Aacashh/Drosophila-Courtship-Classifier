@@ -33,7 +33,7 @@ def export_to_csv(output_path: Path,
             for start_frame, end_frame in bouts:
                 start_time = start_frame / fps
                 end_time = end_frame / fps
-                duration = end_time - start_time
+                duration = (end_frame - start_frame + 1) / fps
                 
                 rows.append({
                     'Behavior': behavior,
