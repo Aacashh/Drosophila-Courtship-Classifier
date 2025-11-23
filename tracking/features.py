@@ -300,26 +300,38 @@ def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2) -> 
                 else:
                     new_theta[t] = t2
             else:
-                # If slow, continuity from previous
-                if t > 0 and not np.isnan(new_theta[t-1]):
-                    prev = new_theta[t-1]
-                    t1 = theta[t] % (2*np.pi)
-                    t2 = (theta[t] + np.pi) % (2*np.pi)
-                    
-                    d1 = abs(t1 - prev)
-                    d1 = min(d1, 2*np.pi - d1)
-                    
-                    d2 = abs(t2 - prev)
-                    d2 = min(d2, 2*np.pi - d2)
-                    
-                    if d1 < d2:
-                        new_theta[t] = t1
-                    else:
-                        new_theta[t] = t2
+                # If slow, prioritize the Pixel Mass Orientation from tracker.
+                # We assume tracker.py has already set theta correctly based on body intensity.
+                new_theta[t] = theta[t]
                         
         tracks['theta'][i] = new_theta
         
     return tracks
+
+def compute_component_velocities(tracks: Dict[str, List[np.ndarray]], fly_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute forward (v_par) and sideways (v_perp) velocities.
+    """
+    x = tracks['x'][fly_idx]
+    y = tracks['y'][fly_idx]
+    theta = tracks['theta'][fly_idx]
+    
+    # Gradient for velocity
+    vx = np.gradient(x)
+    vy = np.gradient(y)
+    
+    # Heading vector
+    hx = np.cos(theta)
+    hy = np.sin(theta)
+    
+    # Forward velocity: projection onto heading
+    v_par = vx * hx + vy * hy
+    
+    # Sideways velocity: projection onto orthogonal vector (-sin, cos)
+    # This gives positive value for movement to the left of the fly
+    v_perp = vx * (-hy) + vy * hx
+    
+    return v_par, v_perp
 
 def compute_social_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int, partner_idx: int) -> Dict[str, np.ndarray]:
     """
@@ -419,6 +431,9 @@ def build_heuristic_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int) 
     # (Caller should have called resolve_head_tail once on tracks)
     
     feats = compute_social_features(tracks, fly_idx, partner_idx)
+    v_par, v_perp = compute_component_velocities(tracks, fly_idx)
+    feats['v_par'] = v_par
+    feats['v_perp'] = v_perp
     feats['wing_angle'] = tracks['wing_angle'][fly_idx]
     feats['area'] = tracks['area'][fly_idx]
     

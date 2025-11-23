@@ -9,7 +9,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 
 # Virtual environments
 venv/
@@ -20,7 +19,6 @@ ENV/
 .vscode/
 .idea/
 *.swp
-*.swo
 
 # OS
 .DS_Store

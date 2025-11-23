@@ -100,7 +100,58 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
             if ma > MA:
                 ma, MA = MA, ma
             
-            # Wing Detection Logic
+            # --- Pixel Mass Orientation Check ---
+            # Correct the 180-degree ambiguity of the ellipse angle.
+            # We assume the "heavier" (darker) side is the wings/tail, so head points away.
+            corrected_angle = angle
+            
+            roi_size = int(max(MA, ma) * 1.5)
+            roi_size = max(roi_size, 20)
+            x_min = max(0, int(cx - roi_size))
+            y_min = max(0, int(cy - roi_size))
+            x_max = min(width, int(cx + roi_size))
+            y_max = min(height, int(cy + roi_size))
+            
+            if x_max > x_min and y_max > y_min:
+                fly_roi = gray[y_min:y_max, x_min:x_max]
+                
+                # Local center
+                roi_cx = cx - x_min
+                roi_cy = cy - y_min
+                
+                # Rotate ROI to align major axis horizontally
+                M_rot = cv2.getRotationMatrix2D((roi_cx, roi_cy), angle, 1.0)
+                
+                h_roi, w_roi = fly_roi.shape
+                # Calculate new bounding box to avoid cutting corners
+                cos_a = np.abs(M_rot[0, 0])
+                sin_a = np.abs(M_rot[0, 1])
+                nW = int((h_roi * sin_a) + (w_roi * cos_a))
+                nH = int((h_roi * cos_a) + (w_roi * sin_a))
+                
+                M_rot[0, 2] += (nW / 2) - roi_cx
+                M_rot[1, 2] += (nH / 2) - roi_cy
+                
+                rotated_roi = cv2.warpAffine(fly_roi, M_rot, (nW, nH))
+                
+                # Split and compare mass (inverted intensity, since fly is dark)
+                center_x = nW // 2
+                left_half = rotated_roi[:, :center_x]
+                right_half = rotated_roi[:, center_x:]
+                
+                if left_half.size > 0 and right_half.size > 0:
+                    left_mass = np.sum(255 - left_half)
+                    right_mass = np.sum(255 - right_half)
+                    
+                    # If Left is heavier (Tail), Head is Right (Direction 0 in rotated frame) -> Angle is correct
+                    # If Right is heavier (Tail), Head is Left (Direction 180 in rotated frame) -> Angle + 180
+                    if right_mass > left_mass:
+                        corrected_angle += 180
+            
+            corrected_angle = corrected_angle % 360.0
+            theta_rad = np.radians(corrected_angle)
+
+            # --- Geometric Wing Angle ---
             # Create a mask for the fitted ellipse (the "body")
             body_mask = np.zeros_like(thresh)
             cv2.ellipse(body_mask, ((cx, cy), (ma, MA), angle), 255, -1)
@@ -110,35 +161,47 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
             cv2.drawContours(contour_mask, [c], -1, 255, -1)
             
             # Subtract body from contour -> wings
-            # We perform a bitwise XOR or simply subtract. 
-            # Since body is an approximation, we intersect with the actual contour first.
-            
-            # Wings are parts of the contour NOT in the ellipse
-            # But ellipse might be slightly smaller/larger.
-            # Let's just look at the difference.
-            # Pixels in contour but NOT in ellipse
             wings_mask = cv2.bitwise_and(contour_mask, cv2.bitwise_not(body_mask))
             
-            wing_area = cv2.countNonZero(wings_mask)
+            # Connected Components to find wing blobs
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(wings_mask, connectivity=8)
             
-            # Heuristic: wing angle is proportional to wing_area / body_area
-            # Max wing extension is usually ~90 degrees (pi/2) per wing or total? 
-            # JAABA expects something roughly in radians or degrees. FlyTracker outputs max angle.
-            # Let's normalize. 
-            # If wings are huge, angle is large.
-            # Empirically, wing_area can be up to ~50% of body area during extension.
-            ratio = wing_area / (area_val + 1e-6)
-            # Simple scaling: if ratio is 0.3, angle might be ~60 degrees?
-            # Let's assume max ratio ~0.5 corresponds to ~90 degrees.
-            w_angle = min(90.0, (ratio / 0.5) * 90.0) 
-            # We want radians often, but let's stick to degrees for now (FlyTracker uses degrees often, JAABA converts).
-            # Wait, JAABA features often use radians. Tracker output usually consistent with input.
-            # Let's output radians.
-            w_angle_rad = np.radians(w_angle)
+            max_blob_area = 0
+            wing_centroid = None
+            
+            # Skip label 0 (background)
+            for i in range(1, num_labels):
+                a_i = stats[i, cv2.CC_STAT_AREA]
+                # Filter small noise
+                if a_i > max_blob_area and a_i > (area_val * 0.05):
+                    max_blob_area = a_i
+                    wing_centroid = centroids[i]
+            
+            w_angle_rad = 0.0
+            
+            if wing_centroid is not None:
+                wx, wy = wing_centroid
+                bx, by = cx, cy
+                
+                # Vector Body->Wing
+                vw_x = wx - bx
+                vw_y = wy - by
+                
+                # Heading Vector
+                vh_x = np.cos(theta_rad)
+                vh_y = np.sin(theta_rad)
+                
+                # Angle between Heading and Body->Wing
+                # dot = |v||w|cos(phi)
+                norm_w = np.hypot(vw_x, vw_y)
+                if norm_w > 1e-6:
+                    dot = (vw_x * vh_x + vw_y * vh_y) / norm_w
+                    dot = np.clip(dot, -1.0, 1.0)
+                    w_angle_rad = np.arccos(dot)
             
             current_detections.append({
                 'x': cx, 'y': cy, 
-                'theta': np.radians(angle), # Store in radians
+                'theta': theta_rad, 
                 'a': MA/2, 'b': ma/2, 
                 'area': area_val,
                 'wing_angle': w_angle_rad

@@ -37,11 +37,11 @@ class HeuristicClassifier:
         # --- Rules ---
         
         # 1. Wing Extension
-        # Rule: Wing angle > 30 degrees (0.52 rad)
+        # Rule: Wing angle > 30 degrees (pi/6)
         # Duration > 0.1s ?
         for i in range(n_flies):
             wing_angle = feats[i]['wing_angle']
-            score = (wing_angle > np.radians(30)).astype(float)
+            score = (wing_angle > (np.pi / 6)).astype(float)
             results['WingExt'][i] = scores_to_bouts(score, min_len=int(0.05 * fps))
 
         # 2. Copulation
@@ -61,17 +61,17 @@ class HeuristicClassifier:
             results['Copulation'][i] = scores_to_bouts(score, min_len=int(5.0 * fps))
             
         # 3. Following
-        # Rule: Moving, Facing Partner, Close
-        # vel > 2 mm/s
+        # Rule: Moving Forward, Facing Partner, Close
+        # v_par > 2 mm/s
         # abs(facing_angle) < 45 deg
         # c2c < 8 mm
         for i in range(n_flies):
             c2c_mm = feats[i]['c2c'] / px_per_mm
-            vel_mm = feats[i]['vel'] / px_per_mm * fps
+            v_par_mm = feats[i]['v_par'] / px_per_mm * fps
             facing = np.abs(feats[i]['facing_angle'])
             
             score = (
-                (vel_mm > 2.0) & 
+                (v_par_mm > 2.0) & 
                 (facing < np.radians(45)) & 
                 (c2c_mm < 10.0) &
                 (c2c_mm > 2.0) # Not touching
@@ -80,18 +80,16 @@ class HeuristicClassifier:
             results['Following'][i] = scores_to_bouts(score, min_len=int(0.5 * fps))
             
         # 4. Circling
-        # Rule: High angular velocity around partner?
-        # Or moving sideways relative to partner?
-        # "Sideways velocity" from repo.
-        # Let's use: Moving, Facing roughly partner (90 deg?), changing bearing?
-        # Simple heuristic: Moving, c2c < 10mm, abs(facing_angle) > 45 deg (side) ?
+        # Rule: Significant lateral movement
+        # |v_perp| > 2.0 mm/s
+        # Facing roughly partner (90 deg?)
         for i in range(n_flies):
             c2c_mm = feats[i]['c2c'] / px_per_mm
-            vel_mm = feats[i]['vel'] / px_per_mm * fps
+            v_perp_mm = feats[i]['v_perp'] / px_per_mm * fps
             facing = np.abs(feats[i]['facing_angle'])
             
             score = (
-                (vel_mm > 2.0) &
+                (np.abs(v_perp_mm) > 2.0) &
                 (c2c_mm < 10.0) &
                 (facing > np.radians(45)) &
                 (facing < np.radians(135)) # Side facing
