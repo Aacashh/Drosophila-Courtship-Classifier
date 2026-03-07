@@ -291,7 +291,7 @@ def verification_viewer():
             else:
                 st.warning("Could not generate preview for this bout.")
         elif not has_video:
-            st.warning(f"No video found for Chamber #{selected}. GIF preview unavailable.")
+            st.caption(f"No video available for Chamber #{selected} — run analysis to generate previews.")
     else:
         st.info("No bouts detected in this chamber.")
 
@@ -435,21 +435,32 @@ def _run_analysis():
         }
 
     # --- Main Workflow ---
-    
-    uploaded_video = st.file_uploader("Choose a Video", type=["mp4", "avi", "mov", "mkv"])
-    
-    if uploaded_video is not None:
-        # Save uploaded video to temp
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(uploaded_video.read())
-        tfile.flush()
-        tfile.close() # Ensure data is flushed to disk
-        video_path = tfile.name
-        
+
+    video_source = st.radio("Video Source", ["Upload File", "Local File Path"], horizontal=True)
+
+    video_path = None
+    if video_source == "Upload File":
+        uploaded_video = st.file_uploader("Choose a Video", type=["mp4", "avi", "mov", "mkv"])
+        if uploaded_video is not None:
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tfile.write(uploaded_video.read())
+            tfile.flush()
+            tfile.close()
+            video_path = tfile.name
+    else:
+        path_input = st.text_input("Enter full path to video file",
+                                   placeholder="e.g. D:/Videos/experiment.mp4")
+        if path_input:
+            if Path(path_input).is_file():
+                video_path = path_input
+            else:
+                st.error(f"File not found: {path_input}")
+
+    if video_path is not None:
         cap = cv2.VideoCapture(video_path)
         ret, first_frame = cap.read()
         cap.release()
-        
+
         if not ret:
             st.error("Could not read video.")
             return
