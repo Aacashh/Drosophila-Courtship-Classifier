@@ -1,0 +1,11 @@
+Behavior,Fly,Duration (s),Start_Frame,End_Frame,Start_Time (mm:ss),End_Time (mm:ss)
+WingExt,Fly 1,0.2,347,352,00:12,00:12
+WingExt,Fly 0,0.133,353,356,00:12,00:12
+Circling,Fly 0,0.333,362,371,00:12,00:12
+Circling,Fly 1,0.367,362,372,00:12,00:12
+WingExt,Fly 0,0.167,367,371,00:12,00:12
+WingExt,Fly 1,0.233,375,381,00:12,00:13
+WingExt,Fly 0,0.133,491,494,00:16,00:16
+WingExt,Fly 1,0.133,494,497,00:16,00:17
+WingExt,Fly 0,0.1,575,577,00:19,00:19
+WingExt,Fly 0,0.1,4500,4502,02:30,02:30

@@ -7,18 +7,73 @@ import shutil
 import time
 import concurrent.futures
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import io
+from PIL import Image
 
 from utils.video import detect_chambers, crop_video, stabilize_video
 from tracking.tracker import track_two_flies
 from tracking.features import build_feature_matrix
 from classification.jab_parser import load_jab_models
 from classification.inference import eval_boosting, scores_to_bouts
-from classification.heuristic import HeuristicClassifier
-from utils.export import export_to_csv, infer_sex
+from classification.heuristic import HeuristicClassifier, DEFAULT_PARAMS
+from utils.export import export_to_csv, infer_sex, export_summary_csv
+from classification.heuristic import compute_courtship_index
 
 st.set_page_config(page_title="Courtship Analysis", layout="wide")
 
-def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm):
+
+# --- Navigation callbacks (must be at module level for on_click) ---
+
+def _vv_prev_bout_sel():
+    idx = st.session_state.get('vv_bout_sel', 0)
+    if idx > 0:
+        st.session_state.vv_bout_sel = idx - 1
+
+
+def _vv_next_bout_sel():
+    idx = st.session_state.get('vv_bout_sel', 0)
+    total = st.session_state.get('_vv_bout_count', 1)
+    if idx < total - 1:
+        st.session_state.vv_bout_sel = idx + 1
+
+
+@st.cache_data
+def _generate_bout_gif(video_path_str, start_frame, end_frame, target_fps=10, max_width=400, max_frames=100):
+    """Generate a lightweight GIF preview of a behavior bout."""
+    cap = cv2.VideoCapture(video_path_str)
+    if not cap.isOpened():
+        return None
+    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(1, int(vid_fps / target_fps))
+
+    pil_frames = []
+    for i in range(start_frame, end_frame + 1, step):
+        if len(pil_frames) >= max_frames:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        if w > max_width:
+            scale = max_width / w
+            rgb = cv2.resize(rgb, (max_width, int(h * scale)))
+        pil_frames.append(Image.fromarray(rgb))
+    cap.release()
+
+    if not pil_frames:
+        return None
+    buf = io.BytesIO()
+    duration_ms = max(50, int(1000 / target_fps))
+    pil_frames[0].save(buf, format='GIF', save_all=True, append_images=pil_frames[1:],
+                       duration=duration_ms, loop=0)
+    return buf.getvalue()
+
+
+def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params=None):
     """Worker function for parallel processing."""
     try:
         # 1. Crop
@@ -55,40 +110,265 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
                     bouts_by_behavior[model.behavior].append(bouts)
         else:
             # Heuristic
-            bouts_by_behavior = HeuristicClassifier.classify(tracks, fps, px_per_mm)
+            bouts_by_behavior = HeuristicClassifier.classify(tracks, fps, px_per_mm, params=heuristic_params)
         
         # 5. Export
         fly_stats = infer_sex(bouts_by_behavior)
         csv_path = output_dir / f"chamber_{i}_results.csv"
         export_to_csv(csv_path, bouts_by_behavior, fps, fly_stats)
-        
-        # Return summary for visualization
+
+        # Export summary CSV with CI and latency
+        n_frames = len(tracks['x'][0])
+        summary_path = output_dir / f"chamber_{i}_summary.csv"
+        export_summary_csv(summary_path, bouts_by_behavior, fps, n_frames, fly_stats)
+
+        # Return summary for visualization (includes CI)
         summary = []
+        for fly_idx in range(n_flies):
+            ci = compute_courtship_index(bouts_by_behavior, n_frames, fly_idx)
+            fly_label = f"Fly {fly_idx}"
+            if fly_idx in fly_stats:
+                if fly_stats[fly_idx].get('is_male'):
+                    fly_label += " (Male)"
+                elif fly_stats[fly_idx].get('is_female'):
+                    fly_label += " (Female)"
+            summary.append({
+                'Chamber': i,
+                'Fly': fly_label,
+                'Behavior': 'Courtship Index',
+                'Count': '',
+                'Total Duration (s)': f"{ci:.1f}%"
+            })
         for beh, bouts_list in bouts_by_behavior.items():
             for fly_idx, bouts in enumerate(bouts_list):
                 duration = sum((e - s + 1) for s, e in bouts) / fps
+                fly_label = f"Fly {fly_idx}"
+                if fly_idx in fly_stats:
+                    if fly_stats[fly_idx].get('is_male'):
+                        fly_label += " (Male)"
+                    elif fly_stats[fly_idx].get('is_female'):
+                        fly_label += " (Female)"
                 summary.append({
                     'Chamber': i,
-                    'Fly': fly_idx,
+                    'Fly': fly_label,
                     'Behavior': beh,
                     'Count': len(bouts),
                     'Total Duration (s)': round(duration, 2)
                 })
-        
+
         return i, True, csv_path, summary
     except Exception as e:
         return i, False, str(e), []
 
-def main():
-    st.title("🦟 Fruit Fly Courtship Analysis System")
-    st.markdown("""
-    **Python-based End-to-End Pipeline**
-    1. Upload Video
-    2. Detect Chambers & Crop
-    3. Track & Classify Behaviors
-    4. Download Results
-    """)
 
+def verification_viewer():
+    """Visual verification tool for reviewing chamber analysis results."""
+
+    # Sidebar controls for verification
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Verification Settings")
+    max_preview_frames = st.sidebar.slider("Preview Max Frames", 10, 300, 100, key="vv_max_frames")
+
+    # Auto-detect results directories
+    possible_dirs = []
+    for d in ["courtship_results", "analysis_results"]:
+        p = Path(d)
+        if p.exists() and list(p.glob("*_results.csv")):
+            possible_dirs.append(d)
+    # Also check session state for analysis output dir
+    if st.session_state.get('_analysis_output_dir'):
+        d = st.session_state._analysis_output_dir
+        if d not in possible_dirs and Path(d).exists() and list(Path(d).glob("*_results.csv")):
+            possible_dirs.append(d)
+
+    if not possible_dirs:
+        st.info("No analysis results found. Run analysis first, or place results in 'courtship_results/' or 'analysis_results/'.")
+        return
+
+    # --- Top controls: directory, chamber, male filter ---
+    top_cols = st.columns([2, 2, 2])
+    with top_cols[0]:
+        results_dir = st.selectbox("Results Folder", possible_dirs, key="vv_dir")
+    results_path = Path(results_dir)
+
+    csv_files = sorted(results_path.glob("*_results.csv"))
+    chambers = []
+    for f in csv_files:
+        try:
+            num = int(f.stem.replace("chamber_", "").replace("_results", ""))
+            chambers.append(num)
+        except ValueError:
+            continue
+
+    if not chambers:
+        st.info("No chamber results found.")
+        return
+    chambers.sort()
+
+    with top_cols[1]:
+        selected = st.selectbox("Chamber", chambers, format_func=lambda x: f"Chamber #{x}", key="vv_chamber")
+    with top_cols[2]:
+        male_only = st.checkbox("Male Only", value=False, key="vv_male_only")
+
+    # Load CSV
+    csv_path = results_path / f"chamber_{selected}_results.csv"
+    df_raw = pd.read_csv(csv_path)
+
+    if 'Start_Frame' not in df_raw.columns or 'End_Frame' not in df_raw.columns:
+        st.error("Results CSV missing Start_Frame/End_Frame columns.")
+        return
+
+    # Apply male filter
+    if male_only:
+        has_male = df_raw['Fly'].str.contains('Male', case=False, na=False).any()
+        if has_male:
+            df = df_raw[df_raw['Fly'].str.contains('Male', case=False, na=False)].copy()
+        else:
+            st.warning("No fly identified as Male in this chamber. Showing all data.")
+            df = df_raw.copy()
+    else:
+        df = df_raw.copy()
+
+    # Find video (prefer stabilized)
+    video_path = results_path / f"chamber_{selected}_stab.mp4"
+    if not video_path.exists():
+        video_path = results_path / f"chamber_{selected}.mp4"
+    has_video = video_path.exists()
+
+    # Get video info
+    fps = 30.0
+    total_frames = 0
+    if has_video:
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+    # --- Cumulative courtship duration metric ---
+    if not df.empty and 'Duration (s)' in df.columns:
+        total_dur = df['Duration (s)'].astype(float).sum()
+        fly_label = "Male" if male_only else "All Flies"
+        st.metric(f"Total Courtship Duration ({fly_label})", f"{total_dur:.1f}s")
+
+    # --- Bout List with Auto GIF Preview ---
+    bout_data = []
+    for _, row in df.iterrows():
+        sf = int(row['Start_Frame'])
+        ef = int(row['End_Frame'])
+        t_s = sf / fps
+        dur = float(row.get('Duration (s)', (ef - sf + 1) / fps))
+        label = f"{row['Behavior']} | {row['Fly']} | {t_s:.1f}s ({dur:.2f}s)"
+        bout_data.append({'label': label, 'start': sf, 'end': ef,
+                          'behavior': row['Behavior'], 'fly': str(row['Fly'])})
+
+    st.session_state._vv_bout_count = len(bout_data)
+    sel_idx = 0
+
+    if bout_data:
+        col_sel, col_prev, col_next = st.columns([4, 1, 1])
+        with col_sel:
+            sel_idx = st.selectbox("Select Bout", range(len(bout_data)),
+                                   format_func=lambda i: bout_data[i]['label'], key="vv_bout_sel")
+        with col_prev:
+            st.write("")
+            st.write("")
+            st.button("Prev Bout", on_click=_vv_prev_bout_sel, key="vv_pbout")
+        with col_next:
+            st.write("")
+            st.write("")
+            st.button("Next Bout", on_click=_vv_next_bout_sel, key="vv_nbout")
+
+        # Auto-show GIF preview for selected bout
+        if has_video and sel_idx < len(bout_data):
+            sel_bout = bout_data[sel_idx]
+            with st.spinner("Generating preview..."):
+                gif_bytes = _generate_bout_gif(str(video_path), sel_bout['start'], sel_bout['end'],
+                                               max_frames=max_preview_frames)
+            if gif_bytes:
+                st.image(gif_bytes,
+                         caption=f"{sel_bout['behavior']} | {sel_bout['fly']} | "
+                                 f"{sel_bout['start']/fps:.1f}s - {sel_bout['end']/fps:.1f}s")
+            else:
+                st.warning("Could not generate preview for this bout.")
+        elif not has_video:
+            st.warning(f"No video found for Chamber #{selected}. GIF preview unavailable.")
+    else:
+        st.info("No bouts detected in this chamber.")
+
+    # --- Behavior Timeline ---
+    if not df.empty:
+        st.write("### Behavior Timeline")
+
+        behaviors = list(df['Behavior'].unique())
+        colors_map = {
+            'WingExt': '#FF6B6B',
+            'Following': '#4ECDC4',
+            'Circling': '#45B7D1',
+            'Copulation': '#96CEB4',
+            'Attempted_Copulation': '#FFEAA7'
+        }
+
+        if behaviors:
+            fig, ax = plt.subplots(figsize=(14, max(1.5, len(behaviors) * 0.8 + 0.5)))
+
+            for _, row in df.iterrows():
+                beh = row['Behavior']
+                beh_idx = behaviors.index(beh)
+                start_s = int(row['Start_Frame']) / fps
+                end_s = int(row['End_Frame']) / fps
+                dur = max(end_s - start_s, 0.5 / fps)
+                color = colors_map.get(beh, '#999999')
+
+                fly_str = str(row['Fly'])
+                if '1' in fly_str.split('Fly')[-1][:3]:
+                    y_pos = beh_idx + 0.15
+                    alpha = 0.5
+                else:
+                    y_pos = beh_idx - 0.15
+                    alpha = 0.85
+
+                ax.barh(y_pos, dur, left=start_s, height=0.25, color=color, alpha=alpha,
+                        edgecolor='black', linewidth=0.3)
+
+            # Highlight selected bout on timeline
+            if bout_data and sel_idx < len(bout_data):
+                sel_bout = bout_data[sel_idx]
+                sel_start_s = sel_bout['start'] / fps
+                sel_end_s = sel_bout['end'] / fps
+                ax.axvspan(sel_start_s, sel_end_s, alpha=0.2, color='red')
+
+            ax.set_yticks(range(len(behaviors)))
+            ax.set_yticklabels(behaviors, fontsize=9)
+            ax.set_xlabel("Time (s)")
+            video_dur = total_frames / fps if total_frames > 0 else (int(df['End_Frame'].max()) / fps)
+            ax.set_xlim(0, video_dur)
+            ax.set_title(f"Chamber #{selected} — Detected Behavior Bouts")
+
+            patches = [mpatches.Patch(color=colors_map.get(b, '#999'), label=b) for b in behaviors]
+            patches.append(mpatches.Patch(color='red', alpha=0.2, label='Selected Bout'))
+            ax.legend(handles=patches, loc='upper right', fontsize=7)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+    # Summary CSV
+    summary_path = results_path / f"chamber_{selected}_summary.csv"
+    if summary_path.exists():
+        with st.expander("Summary Statistics"):
+            summary_df = pd.read_csv(summary_path)
+            if male_only and 'Fly' in summary_df.columns:
+                has_male_s = summary_df['Fly'].str.contains('Male', case=False, na=False).any()
+                if has_male_s:
+                    summary_df = summary_df[summary_df['Fly'].str.contains('Male', case=False, na=False)]
+            st.dataframe(summary_df, use_container_width=True)
+
+    with st.expander("Full Results Table"):
+        st.dataframe(df, use_container_width=True)
+
+
+def _run_analysis():
+    """Main analysis workflow."""
     # --- Step 1: Configuration & Inputs ---
     st.sidebar.header("Settings")
     
@@ -105,7 +385,55 @@ def main():
     
     st.sidebar.subheader("Parameters")
     px_per_mm = st.sidebar.number_input("Pixels per mm (Calibration)", value=15.0, min_value=1.0)
-    
+
+    # --- Heuristic Threshold Controls ---
+    heuristic_params = None
+    if analysis_mode == "Heuristic (Built-in Rules)":
+        with st.sidebar.expander("Heuristic Thresholds"):
+            st.caption("Adjust classification thresholds. Defaults follow literature standards.")
+            d = DEFAULT_PARAMS
+
+            st.markdown("**Wing Extension**")
+            h_wing_angle = st.number_input("Angle (deg)", value=d['wing_ext_angle_deg'], min_value=10, max_value=120, key="h_wing_angle")
+            h_wing_dur = st.number_input("Min Duration (s)", value=d['wing_ext_min_dur_s'], min_value=0.1, max_value=10.0, step=0.1, key="h_wing_dur")
+
+            st.markdown("**Following**")
+            h_fol_vel = st.number_input("Forward Velocity (mm/s)", value=d['follow_velocity_mm_s'], min_value=0.1, max_value=20.0, step=0.1, key="h_fol_vel")
+            h_fol_facing = st.number_input("Facing Angle (deg)", value=d['follow_facing_deg'], min_value=10, max_value=90, key="h_fol_facing")
+            h_fol_dur = st.number_input("Min Duration (s)", value=d['follow_min_dur_s'], min_value=0.1, max_value=10.0, step=0.1, key="h_fol_dur")
+
+            st.markdown("**Circling**")
+            h_cir_vel = st.number_input("Lateral Velocity (mm/s)", value=d['circling_lat_vel_mm_s'], min_value=0.1, max_value=20.0, step=0.1, key="h_cir_vel")
+            h_cir_dur = st.number_input("Min Duration (s)", value=d['circling_min_dur_s'], min_value=0.1, max_value=10.0, step=0.1, key="h_cir_dur")
+
+            st.markdown("**Copulation**")
+            h_cop_dist = st.number_input("Max Distance (mm)", value=d['cop_distance_mm'], min_value=0.1, max_value=10.0, step=0.1, key="h_cop_dist")
+            h_cop_vel = st.number_input("Max Velocity (mm/s)", value=d['cop_velocity_mm_s'], min_value=0.01, max_value=5.0, step=0.05, key="h_cop_vel")
+            h_cop_dur = st.number_input("Min Duration (s)", value=d['cop_min_dur_s'], min_value=1.0, max_value=60.0, step=1.0, key="h_cop_dur")
+
+            st.markdown("**Attempted Copulation**")
+            h_att_dist = st.number_input("Nose Distance (mm)", value=d['att_cop_nose_dist_mm'], min_value=0.1, max_value=5.0, step=0.1, key="h_att_dist")
+            h_att_dur = st.number_input("Min Duration (s)", value=d['att_cop_min_dur_s'], min_value=0.1, max_value=10.0, step=0.1, key="h_att_dur")
+
+            st.markdown("**General**")
+            h_merge = st.number_input("Merge Gap (s)", value=d['merge_gap_s'], min_value=0.0, max_value=5.0, step=0.1, key="h_merge")
+
+        heuristic_params = {
+            'wing_ext_angle_deg': h_wing_angle,
+            'wing_ext_min_dur_s': h_wing_dur,
+            'follow_velocity_mm_s': h_fol_vel,
+            'follow_facing_deg': h_fol_facing,
+            'follow_min_dur_s': h_fol_dur,
+            'circling_lat_vel_mm_s': h_cir_vel,
+            'circling_min_dur_s': h_cir_dur,
+            'cop_distance_mm': h_cop_dist,
+            'cop_velocity_mm_s': h_cop_vel,
+            'cop_min_dur_s': h_cop_dur,
+            'att_cop_nose_dist_mm': h_att_dist,
+            'att_cop_min_dur_s': h_att_dur,
+            'merge_gap_s': h_merge,
+        }
+
     # --- Main Workflow ---
     
     uploaded_video = st.file_uploader("Choose a Video", type=["mp4", "avi", "mov", "mkv"])
@@ -272,7 +600,7 @@ def main():
                 for i in selected_indices:
                     roi = st.session_state.rois[i]
                     futures.append(
-                        executor.submit(process_single_chamber, i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm)
+                        executor.submit(process_single_chamber, i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params)
                     )
                 
                 completed = 0
@@ -295,6 +623,7 @@ def main():
                         st.error(f"Error in Chamber {i}: {result_path}")
                 
             status_text.text("Analysis Complete!")
+            st.session_state._analysis_output_dir = str(output_dir)
             st.balloons()
             
             # --- Download Section ---
@@ -308,9 +637,10 @@ def main():
                     label="Download All Results (ZIP)",
                     data=f,
                     file_name="courtship_results.zip",
-                    mime="application/zip"
+                    mime="application/zip",
+                    key="dl_zip"
                 )
-            
+
             st.write("Individual Files:")
             for res in results:
                 with open(res, "rb") as f:
@@ -318,8 +648,29 @@ def main():
                         label=f"Download {res.name}",
                         data=f,
                         file_name=res.name,
-                        mime="text/csv"
+                        mime="text/csv",
+                        key=f"dl_{res.stem}"
                     )
+
+def main():
+    st.title("Fruit Fly Courtship Analysis System")
+    st.caption("for my lil baby <3")
+    st.markdown("""
+    **Python-based End-to-End Pipeline**
+    1. Upload Video
+    2. Detect Chambers & Crop
+    3. Track & Classify Behaviors
+    4. Download Results
+    """)
+
+    tab_analysis, tab_verify = st.tabs(["Analysis", "Verification"])
+
+    with tab_analysis:
+        _run_analysis()
+
+    with tab_verify:
+        verification_viewer()
+
 
 if __name__ == "__main__":
     main()

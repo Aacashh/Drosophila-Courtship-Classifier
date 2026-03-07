@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
 # --- JAABA Feature Helpers ---
 
@@ -60,7 +61,6 @@ def compute_window_feature(ts: np.ndarray, stat: str, radius: int, offset: int) 
             v = ts[s:e+1]
             out[t] = np.nanstd(v) if v.size else np.nan
     elif stat == 'change':
-        # difference between mean in the last subwindow and first subwindow: use halves
         for t, (s, e) in enumerate(idxs):
             if e <= s:
                 out[t] = 0.0
@@ -72,14 +72,12 @@ def compute_window_feature(ts: np.ndarray, stat: str, radius: int, offset: int) 
             m1 = np.nanmean(v1) if v1.size else 0.0
             out[t] = m1 - m0
     else:
-        # Unsupported stat -> zeros
         out[:] = 0.0
     return out
 
 
 def apply_transform(x: np.ndarray, trans: Any) -> np.ndarray:
     """Apply transform bitmask or string (none/abs/flip/relative)."""
-    # JAABA uses a bitmask; we map basic transforms heuristically
     if isinstance(trans, (str, bytes)):
         tname = trans.decode() if isinstance(trans, (bytes, bytearray)) else trans
         tname = tname.lower()
@@ -90,7 +88,6 @@ def apply_transform(x: np.ndarray, trans: Any) -> np.ndarray:
         if tname == 'relative':
             return _relative_transform(x)
         return x
-    # If numeric bitmask, apply abs (2) and flip (4); relative (8)
     try:
         mask = int(trans)
     except Exception:
@@ -106,13 +103,11 @@ def apply_transform(x: np.ndarray, trans: Any) -> np.ndarray:
 
 
 def _relative_transform(ts: np.ndarray) -> np.ndarray:
-    # Approximate JAABA relative transform using percentiles over finite samples
     x = ts[np.isfinite(ts)]
     if x.size == 0:
         return np.zeros_like(ts)
     prcBins = np.arange(0, 101, 2)
     relBins = np.percentile(x, prcBins)
-    # Map each value to its percentile bin center index normalized [0,1]
     out = np.zeros_like(ts, dtype=np.float32)
     for i, v in enumerate(ts):
         if not np.isfinite(v):
@@ -150,31 +145,24 @@ def compute_extended_window_feature(ts: np.ndarray, stat: str, radius: int, offs
             sd = sd if sd > 1e-6 else 1.0
             out[t] = (ts[t] - m) / sd
     else:
-        # Unsupported stat -> zeros
         out[:] = 0.0
     return out
 
 
 def build_feature_matrix(perframe: Dict[str, List[np.ndarray]], feature_names: List[Any], fly_index: int) -> np.ndarray:
-    """Given perframe data (tracks) and a JAABA-style feature_names token list, build a (nfeat x nframes) matrix for one fly.
-    This implements a useful subset: stats in {mean,min,max,std,change}, transforms {none,abs,flip}. Others map to zeros.
-    """
+    """Given perframe data (tracks) and a JAABA-style feature_names token list, build a (nfeat x nframes) matrix for one fly."""
     rows: List[np.ndarray] = []
-    # feature_names is often a list of token lists per window feature
     for tokens in feature_names or []:
         params = parse_feature_name(tokens)
         stat = str(params.get('stat', 'mean'))
         radius = int(params.get('radius', 5) or 5)
         offset = int(params.get('offset', 0) or 0)
-        # Parse perframe source; in many cases, tokens include something like 'perframe','<name>'
-        # Fall back to commonly used names if unspecified
         pf_name = params.get('perframe') or params.get('feature') or params.get('src')
         if isinstance(pf_name, (list, tuple)):
             pf_name = pf_name[0]
         if isinstance(pf_name, (bytes, bytearray)):
             pf_name = pf_name.decode()
-        
-        # Normalize and map synonyms
+
         synmap = {
             'angle': 'theta', 'absangle': 'theta', 'theta': 'theta',
             'speed': 'vel', 'velmag': 'vel', 'velocity': 'vel', 'dv': 'dv',
@@ -191,21 +179,14 @@ def build_feature_matrix(perframe: Dict[str, List[np.ndarray]], feature_names: L
                 if key.startswith(k.replace('_','')):
                     pf_name = v
                     break
-        
-        # Check availability
-        # perframe values are lists of arrays [fly0, fly1, ...]
+
         if pf_name is None or pf_name not in perframe or fly_index >= len(perframe[pf_name]):
-            # Fallback? or zeros
-            # Try candidates if name is ambiguous
             candidates = ['vel', 'theta', 'dist2wall', 'dcenter', 'wing_angle', 'dpartner', 'area']
             found_name = next((c for c in candidates if c in perframe), None)
-            if found_name and pf_name is None: # Only fallback if we had NO name
+            if found_name and pf_name is None:
                 pf_name = found_name
-            
+
         if pf_name is None or pf_name not in perframe or fly_index >= len(perframe[pf_name]):
-            # Append zeros with same length as others if possible
-            # But we don't know length yet if it's the first row.
-            # Assume standard length if we have any data.
             ref_len = 0
             for v in perframe.values():
                 if v and len(v) > fly_index:
@@ -213,24 +194,18 @@ def build_feature_matrix(perframe: Dict[str, List[np.ndarray]], feature_names: L
                     break
             rows.append(np.zeros(ref_len if ref_len else 1, dtype=np.float32))
             continue
-            
+
         ts = perframe[pf_name][fly_index]
-        
-        # Apply transform to source series before computing the window stat
         src = ts.copy()
         trans = params.get('trans') or params.get('trans_types') or 'none'
         src = apply_transform(src, trans)
-        
-        # Extended stats first, fallback to base
         f = compute_extended_window_feature(src, stat, radius, offset)
         rows.append(f.astype(np.float32))
-        
-    # Normalize shapes; pad with zeros if empty
+
     if not rows:
         n = 1
         rows = [np.zeros(n, dtype=np.float32)]
-    
-    # Align frames
+
     maxlen = max(r.size for r in rows)
     mat = np.zeros((len(rows), maxlen), dtype=np.float32)
     for i, r in enumerate(rows):
@@ -240,14 +215,29 @@ def build_feature_matrix(perframe: Dict[str, List[np.ndarray]], feature_names: L
 
 # --- Heuristic Feature Helpers ---
 
-def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2) -> Dict[str, List[np.ndarray]]:
+def _smooth_positions(arr: np.ndarray, fps: float) -> np.ndarray:
+    """Apply light Gaussian smoothing to a position array before computing velocity."""
+    sigma = max(1.0, 0.05 * fps)  # ~50ms smoothing window
+    # Handle NaN by interpolating, smoothing, then re-NaN-ing
+    nans = np.isnan(arr)
+    if np.all(nans):
+        return arr.copy()
+    if np.any(nans):
+        clean = arr.copy()
+        valid = ~nans
+        indices = np.arange(len(arr))
+        clean[nans] = np.interp(indices[nans], indices[valid], arr[valid])
+        smoothed = gaussian_filter1d(clean, sigma=sigma)
+        smoothed[nans] = np.nan
+        return smoothed
+    return gaussian_filter1d(arr, sigma=sigma)
+
+
+def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2, fps: float = 30.0) -> Dict[str, List[np.ndarray]]:
     """
     Resolve the 180-degree ambiguity of elliptical orientation using velocity.
-    Flies mostly walk forward.
-    Updates 'theta' in tracks to be the heading direction (0-2pi).
-    Adds 'vx', 'vy' if not present.
+    Uses adaptive speed threshold and temporal hysteresis to prevent jitter.
     """
-    # Check if we have enough frames
     n_frames = len(tracks['x'][0])
     if n_frames < 2:
         return tracks
@@ -255,186 +245,189 @@ def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2) -> 
     for i in range(n_flies):
         x = tracks['x'][i]
         y = tracks['y'][i]
-        theta = tracks['theta'][i] # from fitEllipse, usually 0-pi or similar
-        
-        # Calculate velocity
-        vx = np.gradient(x)
-        vy = np.gradient(y)
+        theta = tracks['theta'][i]
+
+        # Smooth positions before computing velocity
+        x_smooth = _smooth_positions(x, fps)
+        y_smooth = _smooth_positions(y, fps)
+
+        vx = np.gradient(x_smooth)
+        vy = np.gradient(y_smooth)
         speed = np.hypot(vx, vy)
-        mv_dir = np.arctan2(vy, vx) # -pi to pi
-        
-        # Correct theta
-        # fitEllipse angle is usually in degrees 0-180 or 0-360?
-        # Our tracker stores it in radians.
-        # We want theta to point towards the head.
-        # If speed is significant, align theta with movement.
-        
+        mv_dir = np.arctan2(vy, vx)
+
+        # Adaptive speed threshold: 20% of median speed (non-NaN frames)
+        valid_speeds = speed[np.isfinite(speed) & (speed > 0)]
+        if valid_speeds.size > 0:
+            speed_threshold = max(0.3, 0.2 * np.median(valid_speeds))
+        else:
+            speed_threshold = 0.5
+
         new_theta = theta.copy()
-        
-        # Smooth speed/dir?
-        
+
         for t in range(n_frames):
             if np.isnan(theta[t]):
                 continue
-                
-            # Check alignment with velocity
-            if speed[t] > 0.5: # 0.5 px/frame threshold
-                # Ellipse angle is bidirectional: theta or theta + pi
-                # Find which is closer to mv_dir
-                
-                # Normalize to 0-2pi
-                t1 = theta[t] % (2*np.pi)
-                t2 = (theta[t] + np.pi) % (2*np.pi)
-                
-                md = mv_dir[t] % (2*np.pi)
-                
-                # Distances
+
+            # Normalize candidates
+            t1 = theta[t] % (2 * np.pi)
+            t2 = (theta[t] + np.pi) % (2 * np.pi)
+
+            if speed[t] > speed_threshold:
+                # Velocity-based choice
+                md = mv_dir[t] % (2 * np.pi)
+
                 d1 = abs(t1 - md)
-                d1 = min(d1, 2*np.pi - d1)
-                
+                d1 = min(d1, 2 * np.pi - d1)
                 d2 = abs(t2 - md)
-                d2 = min(d2, 2*np.pi - d2)
-                
-                if d1 < d2:
-                    new_theta[t] = t1
+                d2 = min(d2, 2 * np.pi - d2)
+
+                vel_choice = t1 if d1 < d2 else t2
+
+                # Hysteresis: prefer previous frame direction unless velocity strongly disagrees
+                if t > 0 and not np.isnan(new_theta[t - 1]):
+                    prev = new_theta[t - 1]
+                    dp1 = abs(t1 - prev)
+                    dp1 = min(dp1, 2 * np.pi - dp1)
+                    dp2 = abs(t2 - prev)
+                    dp2 = min(dp2, 2 * np.pi - dp2)
+                    prev_choice = t1 if dp1 < dp2 else t2
+
+                    if vel_choice != prev_choice:
+                        # Only override continuity if velocity evidence is strong
+                        if abs(d1 - d2) > 0.3:  # > ~17 degrees difference
+                            new_theta[t] = vel_choice
+                        else:
+                            new_theta[t] = prev_choice
+                    else:
+                        new_theta[t] = vel_choice
                 else:
-                    new_theta[t] = t2
+                    new_theta[t] = vel_choice
             else:
-                # If slow, prioritize the Pixel Mass Orientation from tracker.
-                # We assume tracker.py has already set theta correctly based on body intensity.
-                new_theta[t] = theta[t]
-                        
+                # Slow: prefer previous frame direction (temporal continuity)
+                if t > 0 and not np.isnan(new_theta[t - 1]):
+                    prev = new_theta[t - 1]
+                    dp1 = abs(t1 - prev)
+                    dp1 = min(dp1, 2 * np.pi - dp1)
+                    dp2 = abs(t2 - prev)
+                    dp2 = min(dp2, 2 * np.pi - dp2)
+                    new_theta[t] = t1 if dp1 < dp2 else t2
+                else:
+                    # No previous frame — use tracker's pixel mass orientation
+                    new_theta[t] = t1
+
         tracks['theta'][i] = new_theta
-        
+
     return tracks
 
-def compute_component_velocities(tracks: Dict[str, List[np.ndarray]], fly_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute forward (v_par) and sideways (v_perp) velocities.
-    """
+
+def compute_component_velocities(tracks: Dict[str, List[np.ndarray]], fly_idx: int, fps: float = 30.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute forward (v_par) and sideways (v_perp) velocities with temporal smoothing."""
     x = tracks['x'][fly_idx]
     y = tracks['y'][fly_idx]
     theta = tracks['theta'][fly_idx]
-    
-    # Gradient for velocity
-    vx = np.gradient(x)
-    vy = np.gradient(y)
-    
-    # Heading vector
+
+    # Smooth positions before computing gradients
+    x_smooth = _smooth_positions(x, fps)
+    y_smooth = _smooth_positions(y, fps)
+
+    vx = np.gradient(x_smooth)
+    vy = np.gradient(y_smooth)
+
     hx = np.cos(theta)
     hy = np.sin(theta)
-    
-    # Forward velocity: projection onto heading
+
     v_par = vx * hx + vy * hy
-    
-    # Sideways velocity: projection onto orthogonal vector (-sin, cos)
-    # This gives positive value for movement to the left of the fly
     v_perp = vx * (-hy) + vy * hx
-    
+
     return v_par, v_perp
 
-def compute_social_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int, partner_idx: int) -> Dict[str, np.ndarray]:
-    """
-    Compute social features for fly_idx relative to partner_idx.
-    Returns dict of arrays: c2c, n2e, t2e, facing_angle, etc.
-    """
+
+def compute_angular_velocity(tracks: Dict[str, List[np.ndarray]], fly_idx: int, fps: float = 30.0) -> np.ndarray:
+    """Compute angular velocity (rad/s) with smoothing."""
+    theta = tracks['theta'][fly_idx]
+    dtheta = np.diff(theta, prepend=theta[0])
+    # Wrap to [-pi, pi]
+    dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+    ang_vel = dtheta * fps
+    sigma = max(1.0, 0.05 * fps)
+    nans = np.isnan(ang_vel)
+    if np.any(nans) and not np.all(nans):
+        clean = ang_vel.copy()
+        valid = ~nans
+        indices = np.arange(len(ang_vel))
+        clean[nans] = np.interp(indices[nans], indices[valid], ang_vel[valid])
+        smoothed = gaussian_filter1d(clean, sigma=sigma)
+        smoothed[nans] = np.nan
+        return smoothed
+    elif np.all(nans):
+        return ang_vel
+    return gaussian_filter1d(ang_vel, sigma=sigma)
+
+
+def compute_social_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int, partner_idx: int, fps: float = 30.0) -> Dict[str, np.ndarray]:
+    """Compute social features for fly_idx relative to partner_idx."""
     x1, y1, th1 = tracks['x'][fly_idx], tracks['y'][fly_idx], tracks['theta'][fly_idx]
     x2, y2, th2 = tracks['x'][partner_idx], tracks['y'][partner_idx], tracks['theta'][partner_idx]
-    a2, b2 = tracks['a'][partner_idx], tracks['b'][partner_idx] # Major/Minor semi-axes of partner
-    
+    a2, b2 = tracks['a'][partner_idx], tracks['b'][partner_idx]
+
     # 1. Centroid to Centroid
     dx = x2 - x1
     dy = y2 - y1
     c2c = np.hypot(dx, dy)
-    
-    # 2. Facing Angle (angle between fly1 heading and vector to fly2)
-    # vector to fly2
+
+    # 2. Facing Angle
     bearing = np.arctan2(dy, dx)
     facing_angle = bearing - th1
-    # wrap to -pi, pi
-    facing_angle = (facing_angle + np.pi) % (2*np.pi) - np.pi
-    
+    facing_angle = (facing_angle + np.pi) % (2 * np.pi) - np.pi
+
     # 3. Nose to Ellipse (n2e) & Tail to Ellipse (t2e)
-    # Fly1 Nose/Tail positions
-    # Head is at theta
-    # Tail is at theta + pi
-    # Length is 2*a1 ? No, we need a1 (semi-major)
     a1 = tracks['a'][fly_idx]
-    
+
     nose_x = x1 + a1 * np.cos(th1)
     nose_y = y1 + a1 * np.sin(th1)
-    
     tail_x = x1 - a1 * np.cos(th1)
     tail_y = y1 - a1 * np.sin(th1)
-    
-    # Distance to Ellipse 2
-    # Ellipse 2 defined by x2, y2, a2, b2, th2.
-    # Analytical distance to ellipse is hard.
-    # Approx: Distance to centroid minus radius in that direction?
-    # Or closest point on ellipse?
-    # Heuristic from repo: "Nearest distance from nose of fly1 to any point on the ellipse fitted to fly2."
-    # We can sample points on ellipse 2 and find min dist.
-    
-    n_frames = len(x1)
-    n2e = np.zeros(n_frames)
-    t2e = np.zeros(n_frames)
-    
-    # Vectorize sampling? 
-    # Ellipse points: P(t) = Center + R(th2) * [a2*cos(phi), b2*sin(phi)]
-    # We can use just 16 points around the ellipse for approx
-    phi = np.linspace(0, 2*np.pi, 16)
-    cos_phi = np.cos(phi)
-    sin_phi = np.sin(phi)
-    
-    # We have to loop frames or broadcast heavily.
-    # Let's loop frames for clarity/safety, or block process.
-    # To be fast in python, maybe just use centroid distance minus approx radius?
-    # Radius at angle alpha (relative to ellipse axis) is:
-    # r(alpha) = a*b / sqrt((b*cos)^2 + (a*sin)^2)
-    # This is much faster.
-    
-    # Angle of nose relative to ellipse 2 center
+
+    # Analytical ellipse radius approximation
     nose_dx = nose_x - x2
     nose_dy = nose_y - y2
-    nose_phi = np.arctan2(nose_dy, nose_dx) - th2 # Angle relative to ellipse axis
-    
-    # Radius of ellipse 2 in direction of nose
-    r_nose_dir = (a2 * b2) / np.sqrt((b2 * np.cos(nose_phi))**2 + (a2 * np.sin(nose_phi))**2)
+    nose_phi = np.arctan2(nose_dy, nose_dx) - th2
+    r_nose_dir = (a2 * b2) / np.sqrt((b2 * np.cos(nose_phi))**2 + (a2 * np.sin(nose_phi))**2 + 1e-10)
     dist_nose_center = np.hypot(nose_dx, nose_dy)
     n2e = np.maximum(0, dist_nose_center - r_nose_dir)
-    
-    # Same for tail
+
     tail_dx = tail_x - x2
     tail_dy = tail_y - y2
     tail_phi = np.arctan2(tail_dy, tail_dx) - th2
-    r_tail_dir = (a2 * b2) / np.sqrt((b2 * np.cos(tail_phi))**2 + (a2 * np.sin(tail_phi))**2)
+    r_tail_dir = (a2 * b2) / np.sqrt((b2 * np.cos(tail_phi))**2 + (a2 * np.sin(tail_phi))**2 + 1e-10)
     dist_tail_center = np.hypot(tail_dx, tail_dy)
     t2e = np.maximum(0, dist_tail_center - r_tail_dir)
-    
+
+    # Smoothed velocity magnitude
+    x1_smooth = _smooth_positions(x1, fps)
+    y1_smooth = _smooth_positions(y1, fps)
+    vel = np.hypot(np.gradient(x1_smooth), np.gradient(y1_smooth))
+
     return {
         'c2c': c2c,
         'facing_angle': facing_angle,
         'n2e': n2e,
         't2e': t2e,
-        'vel': np.hypot(np.gradient(x1), np.gradient(y1))
+        'vel': vel
     }
 
-# Re-export feature builder that includes these new features
-def build_heuristic_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int) -> Dict[str, np.ndarray]:
-    """
-    Build features for heuristic classification.
-    Assumes 2 flies. Partner is 1-fly_idx.
-    """
+
+def build_heuristic_features(tracks: Dict[str, List[np.ndarray]], fly_idx: int, fps: float = 30.0) -> Dict[str, np.ndarray]:
+    """Build features for heuristic classification."""
     partner_idx = 1 - fly_idx
-    
-    # Ensure head/tail resolved
-    # (Caller should have called resolve_head_tail once on tracks)
-    
-    feats = compute_social_features(tracks, fly_idx, partner_idx)
-    v_par, v_perp = compute_component_velocities(tracks, fly_idx)
+
+    feats = compute_social_features(tracks, fly_idx, partner_idx, fps)
+    v_par, v_perp = compute_component_velocities(tracks, fly_idx, fps)
     feats['v_par'] = v_par
     feats['v_perp'] = v_perp
     feats['wing_angle'] = tracks['wing_angle'][fly_idx]
     feats['area'] = tracks['area'][fly_idx]
-    
+    feats['ang_vel'] = compute_angular_velocity(tracks, fly_idx, fps)
+
     return feats

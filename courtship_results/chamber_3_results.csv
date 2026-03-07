@@ -1,0 +1,6 @@
+Behavior,Fly,Duration (s),Start_Frame,End_Frame,Start_Time (mm:ss),End_Time (mm:ss)
+WingExt,Fly 0 (Male),0.1,431,433,00:14,00:14
+WingExt,Fly 0 (Male),0.167,488,492,00:16,00:16
+WingExt,Fly 1 (Female),0.2,493,498,00:16,00:17
+WingExt,Fly 0 (Male),0.333,497,506,00:17,00:17
+WingExt,Fly 0 (Male),0.133,509,512,00:17,00:17

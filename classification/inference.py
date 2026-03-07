@@ -57,24 +57,37 @@ def eval_boosting(learners: List[WeakLearner], X: np.ndarray) -> np.ndarray:
     return total_score
 
 
-def scores_to_bouts(scores: np.ndarray, threshold: float = 0.0, min_len: int = 1) -> List[Tuple[int, int]]:
+def scores_to_bouts(scores: np.ndarray, threshold: float = 0.0, min_len: int = 1, merge_gap: int = 0) -> List[Tuple[int, int]]:
     """
     Convert continuous scores to start/end indices of bouts.
+    merge_gap: merge adjacent bouts separated by fewer than this many frames.
     """
     # Binary classification
     pred = scores > threshold
-    
+
     # Find runs
     pred = np.concatenate(([False], pred, [False])) # Pad
     # diff != 0 gives edges
     diff = np.diff(pred.astype(int))
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0] - 1 # inclusive end
-    
+
     bouts = []
     for s, e in zip(starts, ends):
         if (e - s + 1) >= min_len:
             bouts.append((s, e))
-            
+
+    # Merge bouts separated by small gaps
+    if merge_gap > 0 and len(bouts) > 1:
+        merged = [bouts[0]]
+        for s, e in bouts[1:]:
+            prev_s, prev_e = merged[-1]
+            if s - prev_e <= merge_gap:
+                merged[-1] = (prev_s, e)
+            else:
+                merged.append((s, e))
+        # Re-filter by min_len after merging
+        bouts = [(s, e) for s, e in merged if (e - s + 1) >= min_len]
+
     return bouts
 
