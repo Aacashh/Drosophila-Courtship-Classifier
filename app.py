@@ -471,12 +471,12 @@ def _run_analysis():
         with col1:
             # ROI Editing state
             if 'rois' not in st.session_state:
-                st.session_state.rois = detect_chambers(first_frame)
+                st.session_state.rois = detect_chambers(first_frame, video_path=video_path)
                 
             # --- Interactive Grid Adjustment ---
             st.write("### Fine-tune Detection")
             if st.button("Re-run Auto Detection"):
-                st.session_state.rois = detect_chambers(first_frame)
+                st.session_state.rois = detect_chambers(first_frame, video_path=video_path)
                 st.rerun()
 
             # Display current ROIs
