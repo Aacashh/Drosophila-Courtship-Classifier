@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import time
+import datetime
 import concurrent.futures
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -76,9 +77,15 @@ def _generate_bout_gif(video_path_str, start_frame, end_frame, target_fps=10, ma
 def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params=None):
     """Worker function for parallel processing."""
     try:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         # 1. Crop
         chamber_video = output_dir / f"chamber_{i}.mp4"
         crop_video(Path(video_path), chamber_video, roi)
+
+        if not chamber_video.exists() or chamber_video.stat().st_size == 0:
+            return i, False, f"Crop failed - output video empty or missing", []
         
         # 2. Stabilize
         final_video = chamber_video
@@ -161,6 +168,41 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
         return i, False, str(e), []
 
 
+def _discover_result_dirs():
+    """Find all result directories. Returns list of (path_str, display_label) sorted newest first."""
+    found = []
+    base = Path("analysis_results")
+    if base.exists():
+        # Check timestamped subdirectories
+        for sub in sorted(base.iterdir(), reverse=True):
+            if sub.is_dir() and list(sub.glob("*_results.csv")):
+                # Parse timestamp from folder name for display
+                try:
+                    dt = datetime.datetime.strptime(sub.name, "%Y-%m-%d_%H-%M-%S")
+                    label = dt.strftime("%b %d, %Y %I:%M %p")
+                except ValueError:
+                    label = sub.name
+                found.append((str(sub), f"{label}  ({sub.name})"))
+        # Also check flat analysis_results/ (legacy)
+        if list(base.glob("*_results.csv")):
+            found.append((str(base), "analysis_results (legacy, no timestamp)"))
+
+    # Legacy courtship_results/
+    legacy = Path("courtship_results")
+    if legacy.exists() and list(legacy.glob("*_results.csv")):
+        found.append((str(legacy), "courtship_results (legacy)"))
+
+    # Session state from current run
+    sess_dir = st.session_state.get('_analysis_output_dir')
+    if sess_dir:
+        sess_path = Path(sess_dir)
+        if sess_path.exists() and list(sess_path.glob("*_results.csv")):
+            if not any(p == sess_dir for p, _ in found):
+                found.insert(0, (sess_dir, f"Current session ({sess_path.name})"))
+
+    return found
+
+
 def verification_viewer():
     """Visual verification tool for reviewing chamber analysis results."""
 
@@ -169,26 +211,21 @@ def verification_viewer():
     st.sidebar.subheader("Verification Settings")
     max_preview_frames = st.sidebar.slider("Preview Max Frames", 10, 300, 100, key="vv_max_frames")
 
-    # Auto-detect results directories
-    possible_dirs = []
-    for d in ["courtship_results", "analysis_results"]:
-        p = Path(d)
-        if p.exists() and list(p.glob("*_results.csv")):
-            possible_dirs.append(d)
-    # Also check session state for analysis output dir
-    if st.session_state.get('_analysis_output_dir'):
-        d = st.session_state._analysis_output_dir
-        if d not in possible_dirs and Path(d).exists() and list(Path(d).glob("*_results.csv")):
-            possible_dirs.append(d)
+    # Auto-detect results directories (timestamped, newest first)
+    result_dirs = _discover_result_dirs()
 
-    if not possible_dirs:
-        st.info("No analysis results found. Run analysis first, or place results in 'courtship_results/' or 'analysis_results/'.")
+    if not result_dirs:
+        st.info("No analysis results found. Run analysis first.")
         return
 
     # --- Top controls: directory, chamber, male filter ---
     top_cols = st.columns([2, 2, 2])
     with top_cols[0]:
-        results_dir = st.selectbox("Results Folder", possible_dirs, key="vv_dir")
+        dir_labels = [label for _, label in result_dirs]
+        dir_paths = [p for p, _ in result_dirs]
+        sel_idx_dir = st.selectbox("Results Folder", range(len(dir_labels)),
+                                   format_func=lambda i: dir_labels[i], key="vv_dir")
+        results_dir = dir_paths[sel_idx_dir]
     results_path = Path(results_dir)
 
     csv_files = sorted(results_path.glob("*_results.csv"))
@@ -589,9 +626,10 @@ def _run_analysis():
                     return
                 st.success(f"Loaded {len(models)} classifiers: {[m.behavior for m in models]}")
             
-            # Create output dir
-            output_dir = Path("analysis_results")
-            output_dir.mkdir(exist_ok=True)
+            # Create timestamped output dir
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            output_dir = Path("analysis_results") / timestamp
+            output_dir.mkdir(parents=True, exist_ok=True)
             
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -634,7 +672,7 @@ def _run_analysis():
                         st.error(f"Error in Chamber {i}: {result_path}")
                 
             status_text.text("Analysis Complete!")
-            st.session_state._analysis_output_dir = str(output_dir)
+            st.session_state._analysis_output_dir = str(output_dir.resolve())
             st.balloons()
             
             # --- Download Section ---

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Tuple, List, Optional
 import subprocess
 import shlex
+import shutil
 
 def stabilize_video(input_path: str, output_path: str, max_iter: int = 50, eps: float = 1e-4) -> bool:
     """
@@ -52,20 +53,42 @@ def stabilize_video(input_path: str, output_path: str, max_iter: int = 50, eps: 
 
 
 def crop_video(src: Path, dst: Path, roi: Tuple[int,int,int,int]) -> None:
-    """
-    Crop video using ffmpeg-python.
-    ROI: (x, y, w, h)
-    """
-    import ffmpeg
+    """Crop video to ROI (x, y, w, h). Uses ffmpeg if available, falls back to OpenCV."""
     x, y, w, h = roi
-    (
-        ffmpeg
-        .input(str(src))
-        .filter('crop', w, h, x, y)
-        .output(str(dst), vcodec='libx264', preset='ultrafast', crf=23, pix_fmt='yuv420p')
-        .overwrite_output()
-        .run(quiet=True)
-    )
+
+    # Try ffmpeg first (faster, better codec support)
+    if shutil.which("ffmpeg"):
+        try:
+            import ffmpeg as ffmpeg_lib
+            (
+                ffmpeg_lib
+                .input(str(src))
+                .filter('crop', w, h, x, y)
+                .output(str(dst), vcodec='libx264', preset='ultrafast', crf=23, pix_fmt='yuv420p')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return
+        except Exception:
+            pass  # fall through to OpenCV
+
+    # OpenCV fallback
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {src}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(dst), fourcc, fps, (w, h))
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cropped = frame[y:y+h, x:x+w]
+        if cropped.shape[1] != w or cropped.shape[0] != h:
+            cropped = cv2.resize(cropped, (w, h))
+        out.write(cropped)
+    cap.release()
+    out.release()
 
 def _get_stable_frame(video_path: str, n_samples: int = 5) -> Optional[np.ndarray]:
     """Sample multiple frames from the video and return the median to reduce
@@ -131,10 +154,73 @@ def _find_grid_regions(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
     return grids
 
 
+def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+    """Given rough chamber detections, infer a regular grid and snap boxes to it.
+    This ensures uniform box sizes that extend fully to the grid lines, fixing
+    the issue where contour detection clips chamber edges."""
+    if len(candidates) < 2:
+        return candidates
+
+    # Compute centers
+    cx = np.array([c[0] + c[2] / 2 for c in candidates])
+    cy = np.array([c[1] + c[3] / 2 for c in candidates])
+
+    # Cluster Y coords into rows using median height as guide
+    median_h = np.median([c[3] for c in candidates])
+    median_w = np.median([c[2] for c in candidates])
+
+    # Sort by Y, then cluster into rows
+    sorted_y = np.sort(cy)
+    row_breaks = [0]
+    for i in range(1, len(sorted_y)):
+        if sorted_y[i] - sorted_y[i-1] > median_h * 0.4:
+            row_breaks.append(i)
+    row_centers = []
+    for i in range(len(row_breaks)):
+        start = row_breaks[i]
+        end = row_breaks[i+1] if i+1 < len(row_breaks) else len(sorted_y)
+        row_centers.append(np.mean(sorted_y[start:end]))
+    n_rows = len(row_centers)
+
+    # Sort by X, then cluster into cols
+    sorted_x = np.sort(cx)
+    col_breaks = [0]
+    for i in range(1, len(sorted_x)):
+        if sorted_x[i] - sorted_x[i-1] > median_w * 0.4:
+            col_breaks.append(i)
+    col_centers = []
+    for i in range(len(col_breaks)):
+        start = col_breaks[i]
+        end = col_breaks[i+1] if i+1 < len(col_breaks) else len(sorted_x)
+        col_centers.append(np.mean(sorted_x[start:end]))
+    n_cols = len(col_centers)
+
+    if n_rows < 1 or n_cols < 1:
+        return candidates
+
+    # Compute uniform cell size: use the 75th percentile of detected sizes
+    # (larger than median to avoid clipping edges)
+    widths = np.array([c[2] for c in candidates])
+    heights = np.array([c[3] for c in candidates])
+    cell_w = int(np.percentile(widths, 75))
+    cell_h = int(np.percentile(heights, 75))
+
+    # Reconstruct grid from row/col centers with uniform size
+    snapped = []
+    for ry in row_centers:
+        for cx_val in col_centers:
+            x = int(cx_val - cell_w / 2)
+            y = int(ry - cell_h / 2)
+            snapped.append((x, y, cell_w, cell_h))
+
+    return snapped
+
+
 def _detect_chambers_in_region(gray: np.ndarray, region: Tuple[int, int, int, int],
                                 padding: int = 15) -> List[Tuple[int, int, int, int]]:
     """Detect individual chambers within a grid region.
-    Coordinates are returned in full-frame space."""
+    Uses contour detection to find chamber candidates, then snaps them to a
+    regular grid to ensure full edge coverage. Coordinates returned in full-frame space."""
     rx, ry, rw, rh = region
     roi = gray[ry:ry+rh, rx:rx+rw]
     roi_h, roi_w = roi.shape[:2]
@@ -168,11 +254,13 @@ def _detect_chambers_in_region(gray: np.ndarray, region: Tuple[int, int, int, in
     # Filter by size consistency: reject outliers (hands, debris)
     areas = np.array([c[2] * c[3] for c in candidates])
     median_area = np.median(areas)
-    # Keep chambers within 2x of median size
     candidates = [c for c, a in zip(candidates, areas) if 0.4 * median_area < a < 2.5 * median_area]
 
     if not candidates:
         return []
+
+    # Snap to a regular grid for uniform, edge-inclusive boxes
+    candidates = _snap_to_grid(candidates)
 
     # Apply padding and convert to full-frame coordinates
     full_h, full_w = gray.shape[:2]
