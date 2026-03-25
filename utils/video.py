@@ -6,9 +6,13 @@ import subprocess
 import shlex
 import shutil
 
-def stabilize_video(input_path: str, output_path: str, max_iter: int = 50, eps: float = 1e-4) -> bool:
-    """
-    Stabilize video by aligning all frames to the first frame using ECC.
+def stabilize_video(input_path: str, output_path: str, max_iter: int = 20, eps: float = 1e-3) -> bool:
+    """Stabilize video by aligning all frames to the first frame using ECC.
+
+    Optimizations over naive approach:
+    - ECC computed on half-resolution images (4x faster per call)
+    - Reduced max_iter (20 vs 50) and looser eps — sufficient for small chamber crops
+    - Frames with negligible motion reuse previous warp for next N frames
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -20,29 +24,65 @@ def stabilize_video(input_path: str, output_path: str, max_iter: int = 50, eps: 
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-    
+
     ret, ref = cap.read()
     if not ret:
+        cap.release()
         return False
 
     ref_gray = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
-    ref_gray = cv2.GaussianBlur(ref_gray, (5,5), 0)
+    ref_gray = cv2.GaussianBlur(ref_gray, (5, 5), 0)
+
+    # Downsampled reference for ECC (half resolution)
+    scale = 0.5
+    ref_small = cv2.resize(ref_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
     warp_mode = cv2.MOTION_EUCLIDEAN
-    warp = np.eye(2, 3, dtype=np.float32)
+    warp_small = np.eye(2, 3, dtype=np.float32)
+    warp_full = np.eye(2, 3, dtype=np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, max_iter, eps)
 
     out.write(ref)
+
+    skip_counter = 0  # frames to skip ECC recomputation
+    SKIP_FRAMES = 5   # reuse warp for this many frames when motion is negligible
+    MOTION_THRESH = 0.5  # pixels — below this, skip ECC
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+
+        if skip_counter > 0:
+            # Reuse previous warp without recomputing ECC
+            skip_counter -= 1
+            aligned = cv2.warpAffine(frame, warp_full, (w, h),
+                                     flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                     borderMode=cv2.BORDER_REPLICATE)
+            out.write(aligned)
+            continue
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5,5), 0)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # ECC on downsampled images
+        gray_small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         try:
-            cc, warp = cv2.findTransformECC(ref_gray, gray, warp, warp_mode, criteria, None, 1)
-            aligned = cv2.warpAffine(frame, warp, (w, h), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+            _, warp_small = cv2.findTransformECC(ref_small, gray_small, warp_small,
+                                                  warp_mode, criteria, None, 1)
+            # Scale translation back to full resolution
+            warp_full = warp_small.copy()
+            warp_full[0, 2] /= scale
+            warp_full[1, 2] /= scale
+
+            aligned = cv2.warpAffine(frame, warp_full, (w, h),
+                                     flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                     borderMode=cv2.BORDER_REPLICATE)
+
+            # If motion is negligible, skip ECC for next N frames
+            motion = np.hypot(warp_full[0, 2], warp_full[1, 2])
+            if motion < MOTION_THRESH:
+                skip_counter = SKIP_FRAMES
         except Exception:
             aligned = frame
         out.write(aligned)

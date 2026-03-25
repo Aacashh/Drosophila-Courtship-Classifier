@@ -265,37 +265,41 @@ def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2, fps
 
         new_theta = theta.copy()
 
+        # Pre-compute all normalized candidates outside the loop
+        TWO_PI = 2 * np.pi
+        t1_all = theta % TWO_PI
+        t2_all = (theta + np.pi) % TWO_PI
+        md_all = mv_dir % TWO_PI
+        is_nan = np.isnan(theta)
+        is_fast = speed > speed_threshold
+
         for t in range(n_frames):
-            if np.isnan(theta[t]):
+            if is_nan[t]:
                 continue
 
-            # Normalize candidates
-            t1 = theta[t] % (2 * np.pi)
-            t2 = (theta[t] + np.pi) % (2 * np.pi)
+            t1 = t1_all[t]
+            t2 = t2_all[t]
 
-            if speed[t] > speed_threshold:
-                # Velocity-based choice
-                md = mv_dir[t] % (2 * np.pi)
+            if is_fast[t]:
+                md = md_all[t]
 
                 d1 = abs(t1 - md)
-                d1 = min(d1, 2 * np.pi - d1)
+                d1 = min(d1, TWO_PI - d1)
                 d2 = abs(t2 - md)
-                d2 = min(d2, 2 * np.pi - d2)
+                d2 = min(d2, TWO_PI - d2)
 
                 vel_choice = t1 if d1 < d2 else t2
 
-                # Hysteresis: prefer previous frame direction unless velocity strongly disagrees
                 if t > 0 and not np.isnan(new_theta[t - 1]):
                     prev = new_theta[t - 1]
                     dp1 = abs(t1 - prev)
-                    dp1 = min(dp1, 2 * np.pi - dp1)
+                    dp1 = min(dp1, TWO_PI - dp1)
                     dp2 = abs(t2 - prev)
-                    dp2 = min(dp2, 2 * np.pi - dp2)
+                    dp2 = min(dp2, TWO_PI - dp2)
                     prev_choice = t1 if dp1 < dp2 else t2
 
                     if vel_choice != prev_choice:
-                        # Only override continuity if velocity evidence is strong
-                        if abs(d1 - d2) > 0.3:  # > ~17 degrees difference
+                        if abs(d1 - d2) > 0.3:
                             new_theta[t] = vel_choice
                         else:
                             new_theta[t] = prev_choice
@@ -304,16 +308,14 @@ def resolve_head_tail(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2, fps
                 else:
                     new_theta[t] = vel_choice
             else:
-                # Slow: prefer previous frame direction (temporal continuity)
                 if t > 0 and not np.isnan(new_theta[t - 1]):
                     prev = new_theta[t - 1]
                     dp1 = abs(t1 - prev)
-                    dp1 = min(dp1, 2 * np.pi - dp1)
+                    dp1 = min(dp1, TWO_PI - dp1)
                     dp2 = abs(t2 - prev)
-                    dp2 = min(dp2, 2 * np.pi - dp2)
+                    dp2 = min(dp2, TWO_PI - dp2)
                     new_theta[t] = t1 if dp1 < dp2 else t2
                 else:
-                    # No previous frame — use tracker's pixel mass orientation
                     new_theta[t] = t1
 
         tracks['theta'][i] = new_theta

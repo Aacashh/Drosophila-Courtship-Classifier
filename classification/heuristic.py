@@ -1,5 +1,6 @@
 from typing import Dict, List, Tuple
 import numpy as np
+import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 from .inference import scores_to_bouts
 
@@ -105,10 +106,7 @@ class HeuristicClassifier:
             win = int(2.0 * fps)
             if win < 3:
                 win = 3
-            c2c_std = np.array([
-                np.std(c2c_mm[max(0, t - win // 2):t + win // 2 + 1])
-                for t in range(n_frames)
-            ])
+            c2c_std = pd.Series(c2c_mm).rolling(win, center=True, min_periods=1).std().fillna(0).values
             is_stable = c2c_std < p['cop_stability_mm']
 
             score = (is_close & is_slow & is_stable).astype(float)

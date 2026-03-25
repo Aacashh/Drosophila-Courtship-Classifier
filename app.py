@@ -6,12 +6,20 @@ import tempfile
 import shutil
 import time
 import datetime
+import json
+import gc
 import concurrent.futures
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import io
 from PIL import Image
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 from utils.video import detect_chambers, crop_video, stabilize_video
 from tracking.tracker import track_two_flies
@@ -163,8 +171,13 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
                     'Total Duration (s)': round(duration, 2)
                 })
 
+        # Cleanup large objects to free memory for next chamber
+        del tracks, bouts_by_behavior
+        gc.collect()
+
         return i, True, csv_path, summary
     except Exception as e:
+        gc.collect()
         return i, False, str(e), []
 
 
@@ -639,37 +652,102 @@ def _run_analysis():
             st.subheader("3. Real-time Results")
             results_container = st.container()
             
-            # Parallel Processing
-            max_workers = min(4, len(selected_indices)) 
-            
+            # --- RAM-aware worker count ---
+            if _HAS_PSUTIL:
+                avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+                max_by_ram = max(1, int(avail_gb / 0.5))
+                max_workers = min(max_by_ram, len(selected_indices), 4)
+            else:
+                max_workers = min(2, len(selected_indices))
+            status_text.text(f"Using {max_workers} parallel worker(s)...")
+
+            # --- Resume: skip already-completed chambers ---
+            progress_file = output_dir / "_progress.json"
+            completed_chambers = set()
+            if progress_file.exists():
+                try:
+                    completed_chambers = set(json.loads(progress_file.read_text()))
+                except Exception:
+                    completed_chambers = set()
+
             all_summaries = []
-            
-            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for i in selected_indices:
-                    roi = st.session_state.rois[i]
-                    futures.append(
-                        executor.submit(process_single_chamber, i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params)
-                    )
-                
-                completed = 0
-                for future in concurrent.futures.as_completed(futures):
-                    i, success, result_path, summary = future.result()
-                    completed += 1
-                    progress_bar.progress(completed / len(selected_indices))
-                    
-                    if success:
-                        status_text.text(f"Finished Chamber {i}")
-                        all_summaries.extend(summary)
-                        
-                        # Update Table
-                        if all_summaries:
-                            df = pd.DataFrame(all_summaries)
-                            # Pivot for cleaner view? Or just raw table
-                            results_container.dataframe(df, use_container_width=True)
-                            
-                    else:
-                        st.error(f"Error in Chamber {i}: {result_path}")
+            chambers_to_run = []
+            for i in selected_indices:
+                existing_csv = output_dir / f"chamber_{i}_results.csv"
+                if i in completed_chambers and existing_csv.exists():
+                    # Load existing results for display
+                    try:
+                        df_existing = pd.read_csv(existing_csv)
+                        for _, row in df_existing.iterrows():
+                            all_summaries.append({
+                                'Chamber': i, 'Fly': row.get('Fly', ''),
+                                'Behavior': row.get('Behavior', ''),
+                                'Count': 1, 'Total Duration (s)': row.get('Duration (s)', 0)
+                            })
+                    except Exception:
+                        pass
+                    status_text.text(f"Chamber {i} already complete — skipping")
+                else:
+                    chambers_to_run.append(i)
+
+            if chambers_to_run:
+                skipped = len(selected_indices) - len(chambers_to_run)
+                if skipped > 0:
+                    st.info(f"Resuming: {skipped} chamber(s) already done, {len(chambers_to_run)} remaining")
+
+            total_to_process = len(selected_indices)
+            completed = total_to_process - len(chambers_to_run)
+            if completed > 0:
+                progress_bar.progress(completed / total_to_process)
+
+            CHAMBER_TIMEOUT = 600  # 10 minutes per chamber
+
+            if chambers_to_run:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_idx = {}
+                    for i in chambers_to_run:
+                        roi = st.session_state.rois[i]
+                        f = executor.submit(
+                            process_single_chamber, i, roi, video_path,
+                            output_dir, do_stabilize, analysis_mode, models,
+                            px_per_mm, heuristic_params
+                        )
+                        future_to_idx[f] = i
+
+                    for future in concurrent.futures.as_completed(future_to_idx):
+                        chamber_idx = future_to_idx[future]
+                        try:
+                            i, success, result_path, summary = future.result(timeout=CHAMBER_TIMEOUT)
+                        except concurrent.futures.TimeoutError:
+                            st.warning(f"Chamber {chamber_idx} timed out after {CHAMBER_TIMEOUT}s — skipping")
+                            completed += 1
+                            progress_bar.progress(completed / total_to_process)
+                            continue
+                        except (concurrent.futures.BrokenExecutor, Exception) as e:
+                            st.error(f"Chamber {chamber_idx} worker crashed: {e}")
+                            completed += 1
+                            progress_bar.progress(completed / total_to_process)
+                            continue
+
+                        completed += 1
+                        progress_bar.progress(completed / total_to_process)
+
+                        if success:
+                            status_text.text(f"Finished Chamber {i} ({completed}/{total_to_process})")
+                            all_summaries.extend(summary)
+
+                            # Save progress incrementally
+                            completed_chambers.add(i)
+                            try:
+                                progress_file.write_text(json.dumps(sorted(completed_chambers)))
+                            except Exception:
+                                pass
+
+                            if all_summaries:
+                                df = pd.DataFrame(all_summaries)
+                                results_container.dataframe(df, use_container_width=True)
+                        else:
+                            st.error(f"Error in Chamber {i}: {result_path}")
                 
             status_text.text("Analysis Complete!")
             st.session_state._analysis_output_dir = str(output_dir.resolve())

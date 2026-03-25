@@ -204,6 +204,7 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
                 ma, MA = MA, ma
 
             # --- Pixel Mass Orientation Check ---
+            # Project thresholded pixels along body axis instead of warpAffine
             corrected_angle = angle
 
             roi_size = int(max(MA, ma) * 1.5)
@@ -214,33 +215,20 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
             y_max = min(height, int(cy + roi_size))
 
             if x_max > x_min and y_max > y_min:
-                fly_roi = gray[y_min:y_max, x_min:x_max]
+                roi_thresh = thresh[y_min:y_max, x_min:x_max]
+                roi_gray = gray[y_min:y_max, x_min:x_max]
+                ys, xs = np.where(roi_thresh > 0)
 
-                roi_cx = cx - x_min
-                roi_cy = cy - y_min
+                if len(xs) > 0:
+                    dx = xs - (cx - x_min)
+                    dy = ys - (cy - y_min)
+                    angle_rad = np.radians(angle)
+                    proj = dx * np.cos(angle_rad) + dy * np.sin(angle_rad)
+                    intensity = (255 - roi_gray[ys, xs]).astype(np.float32)
+                    head_mass = np.sum(intensity[proj > 0])
+                    tail_mass = np.sum(intensity[proj < 0])
 
-                M_rot = cv2.getRotationMatrix2D((roi_cx, roi_cy), angle, 1.0)
-
-                h_roi, w_roi = fly_roi.shape
-                cos_a = np.abs(M_rot[0, 0])
-                sin_a = np.abs(M_rot[0, 1])
-                nW = int((h_roi * sin_a) + (w_roi * cos_a))
-                nH = int((h_roi * cos_a) + (w_roi * sin_a))
-
-                M_rot[0, 2] += (nW / 2) - roi_cx
-                M_rot[1, 2] += (nH / 2) - roi_cy
-
-                rotated_roi = cv2.warpAffine(fly_roi, M_rot, (nW, nH))
-
-                center_x = nW // 2
-                left_half = rotated_roi[:, :center_x]
-                right_half = rotated_roi[:, center_x:]
-
-                if left_half.size > 0 and right_half.size > 0:
-                    left_mass = np.sum(255 - left_half)
-                    right_mass = np.sum(255 - right_half)
-
-                    if right_mass > left_mass:
+                    if tail_mass > head_mass:
                         corrected_angle += 180
 
             corrected_angle = corrected_angle % 360.0
