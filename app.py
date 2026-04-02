@@ -781,7 +781,7 @@ def _run_analysis():
 
 def main():
     st.title("Fruit Fly Courtship Analysis System")
-    st.caption("for my lil baby <3")
+    # st.caption("for my lil baby <3")
     st.markdown("""
     **Python-based End-to-End Pipeline**
     1. Upload Video
