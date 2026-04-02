@@ -156,7 +156,7 @@ def _get_stable_frame(video_path: str, n_samples: int = 5) -> Optional[np.ndarra
 
 def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
     """Given rough chamber detections, infer a regular grid and snap boxes to it.
-    This ensures uniform box sizes that extend fully to the grid lines."""
+    Cell sizes are constrained by center-to-center spacing so boxes never overlap."""
     if len(candidates) < 2:
         return candidates
 
@@ -166,8 +166,7 @@ def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int
     median_w = np.median([c[2] for c in candidates])
 
     # Cluster Y coords into rows
-    sorted_indices_y = np.argsort(cy)
-    sorted_cy = cy[sorted_indices_y]
+    sorted_cy = np.sort(cy)
     row_breaks = [0]
     for i in range(1, len(sorted_cy)):
         if sorted_cy[i] - sorted_cy[i - 1] > median_h * 0.4:
@@ -179,8 +178,7 @@ def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int
         row_centers.append(np.mean(sorted_cy[start:end]))
 
     # Cluster X coords into cols
-    sorted_indices_x = np.argsort(cx)
-    sorted_cx = cx[sorted_indices_x]
+    sorted_cx = np.sort(cx)
     col_breaks = [0]
     for i in range(1, len(sorted_cx)):
         if sorted_cx[i] - sorted_cx[i - 1] > median_w * 0.4:
@@ -194,15 +192,40 @@ def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int
     if len(row_centers) < 1 or len(col_centers) < 1:
         return candidates
 
-    # Uniform cell size: 75th percentile (slightly larger to avoid clipping edges)
-    widths = np.array([c[2] for c in candidates])
-    heights = np.array([c[3] for c in candidates])
-    cell_w = int(np.percentile(widths, 75))
-    cell_h = int(np.percentile(heights, 75))
+    # --- Compute cell size constrained by center-to-center spacing ---
+    # The detected contour size is an upper estimate; the actual chamber
+    # cannot be wider than the gap between adjacent centers (otherwise
+    # boxes overlap).  Use the minimum spacing as a hard cap.
+
+    det_w = int(np.median([c[2] for c in candidates]))
+    det_h = int(np.median([c[3] for c in candidates]))
+
+    # Min spacing between adjacent column / row centers
+    col_centers_sorted = sorted(col_centers)
+    row_centers_sorted = sorted(row_centers)
+
+    if len(col_centers_sorted) >= 2:
+        min_col_spacing = min(col_centers_sorted[i + 1] - col_centers_sorted[i]
+                              for i in range(len(col_centers_sorted) - 1))
+        # Cell width = spacing minus a small gap (at least 4px divider preserved)
+        cell_w = int(min(det_w, min_col_spacing - 4))
+    else:
+        cell_w = det_w
+
+    if len(row_centers_sorted) >= 2:
+        min_row_spacing = min(row_centers_sorted[i + 1] - row_centers_sorted[i]
+                              for i in range(len(row_centers_sorted) - 1))
+        cell_h = int(min(det_h, min_row_spacing - 4))
+    else:
+        cell_h = det_h
+
+    # Safety floor: cell can't be smaller than 50% of median detection
+    cell_w = max(cell_w, det_w // 2)
+    cell_h = max(cell_h, det_h // 2)
 
     snapped = []
-    for ry in row_centers:
-        for cx_val in col_centers:
+    for ry in row_centers_sorted:
+        for cx_val in col_centers_sorted:
             x = int(cx_val - cell_w / 2)
             y = int(ry - cell_h / 2)
             snapped.append((x, y, cell_w, cell_h))
@@ -283,13 +306,36 @@ def _filter_size_outliers(candidates: List[Tuple[int, int, int, int]],
 def _add_padding(candidates: List[Tuple[int, int, int, int]],
                  padding: int, img_w: int, img_h: int
                  ) -> List[Tuple[int, int, int, int]]:
-    """Add padding to bounding boxes, clamped to image dimensions."""
+    """Add padding to bounding boxes, clamped to image dimensions and
+    limited so adjacent boxes never overlap."""
+    if not candidates:
+        return candidates
+
+    # Compute the maximum safe padding from center-to-center spacing.
+    # For a grid, half the gap between adjacent centers minus half the
+    # cell size gives the max expansion in each direction.
+    centers_x = sorted(set(c[0] + c[2] / 2 for c in candidates))
+    centers_y = sorted(set(c[1] + c[3] / 2 for c in candidates))
+    median_w = np.median([c[2] for c in candidates])
+    median_h = np.median([c[3] for c in candidates])
+
+    max_pad_x = padding
+    max_pad_y = padding
+    if len(centers_x) >= 2:
+        min_gap_x = min(centers_x[i + 1] - centers_x[i] for i in range(len(centers_x) - 1))
+        available_x = (min_gap_x - median_w) / 2
+        max_pad_x = max(0, int(min(padding, available_x - 1)))
+    if len(centers_y) >= 2:
+        min_gap_y = min(centers_y[i + 1] - centers_y[i] for i in range(len(centers_y) - 1))
+        available_y = (min_gap_y - median_h) / 2
+        max_pad_y = max(0, int(min(padding, available_y - 1)))
+
     result = []
     for (x, y, w, h) in candidates:
-        px = max(0, x - padding)
-        py = max(0, y - padding)
-        pw = min(img_w - px, w + 2 * padding)
-        ph = min(img_h - py, h + 2 * padding)
+        px = max(0, x - max_pad_x)
+        py = max(0, y - max_pad_y)
+        pw = min(img_w - px, w + 2 * max_pad_x)
+        ph = min(img_h - py, h + 2 * max_pad_y)
         result.append((px, py, pw, ph))
     return result
 
