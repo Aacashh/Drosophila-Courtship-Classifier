@@ -154,98 +154,52 @@ def _get_stable_frame(video_path: str, n_samples: int = 5) -> Optional[np.ndarra
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def _find_grid_regions(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """Detect one or more large grid panels in the frame.
-    Returns bounding boxes (x, y, w, h) for each grid region found."""
-    h_img, w_img = gray.shape[:2]
-    img_area = h_img * w_img
-
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    _, bin_img = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Heavy closing to merge all chambers within a grid into one blob
-    # Kernel proportional to image size so it works at any resolution
-    kw = max(31, w_img // 15) | 1  # ensure odd
-    kh = max(31, h_img // 15) | 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
-    merged = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, kernel, iterations=3)
-
-    # Light opening to remove thin noise bridges between grids
-    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (kw // 3 | 1, kh // 3 | 1))
-    merged = cv2.morphologyEx(merged, cv2.MORPH_OPEN, open_k, iterations=1)
-
-    cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    grids = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        # A grid panel should be at least 5% of the image
-        if area < img_area * 0.05:
-            continue
-        x, y, rw, rh = cv2.boundingRect(c)
-        # Reject very elongated blobs (not a grid)
-        ar = float(rw) / rh if rh > 0 else 0
-        if ar < 0.3 or ar > 3.0:
-            continue
-        grids.append((x, y, rw, rh))
-
-    # Sort left-to-right
-    grids.sort(key=lambda r: r[0])
-    return grids
-
-
 def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
     """Given rough chamber detections, infer a regular grid and snap boxes to it.
-    This ensures uniform box sizes that extend fully to the grid lines, fixing
-    the issue where contour detection clips chamber edges."""
+    This ensures uniform box sizes that extend fully to the grid lines."""
     if len(candidates) < 2:
         return candidates
 
-    # Compute centers
     cx = np.array([c[0] + c[2] / 2 for c in candidates])
     cy = np.array([c[1] + c[3] / 2 for c in candidates])
-
-    # Cluster Y coords into rows using median height as guide
     median_h = np.median([c[3] for c in candidates])
     median_w = np.median([c[2] for c in candidates])
 
-    # Sort by Y, then cluster into rows
-    sorted_y = np.sort(cy)
+    # Cluster Y coords into rows
+    sorted_indices_y = np.argsort(cy)
+    sorted_cy = cy[sorted_indices_y]
     row_breaks = [0]
-    for i in range(1, len(sorted_y)):
-        if sorted_y[i] - sorted_y[i-1] > median_h * 0.4:
+    for i in range(1, len(sorted_cy)):
+        if sorted_cy[i] - sorted_cy[i - 1] > median_h * 0.4:
             row_breaks.append(i)
     row_centers = []
     for i in range(len(row_breaks)):
         start = row_breaks[i]
-        end = row_breaks[i+1] if i+1 < len(row_breaks) else len(sorted_y)
-        row_centers.append(np.mean(sorted_y[start:end]))
-    n_rows = len(row_centers)
+        end = row_breaks[i + 1] if i + 1 < len(row_breaks) else len(sorted_cy)
+        row_centers.append(np.mean(sorted_cy[start:end]))
 
-    # Sort by X, then cluster into cols
-    sorted_x = np.sort(cx)
+    # Cluster X coords into cols
+    sorted_indices_x = np.argsort(cx)
+    sorted_cx = cx[sorted_indices_x]
     col_breaks = [0]
-    for i in range(1, len(sorted_x)):
-        if sorted_x[i] - sorted_x[i-1] > median_w * 0.4:
+    for i in range(1, len(sorted_cx)):
+        if sorted_cx[i] - sorted_cx[i - 1] > median_w * 0.4:
             col_breaks.append(i)
     col_centers = []
     for i in range(len(col_breaks)):
         start = col_breaks[i]
-        end = col_breaks[i+1] if i+1 < len(col_breaks) else len(sorted_x)
-        col_centers.append(np.mean(sorted_x[start:end]))
-    n_cols = len(col_centers)
+        end = col_breaks[i + 1] if i + 1 < len(col_breaks) else len(sorted_cx)
+        col_centers.append(np.mean(sorted_cx[start:end]))
 
-    if n_rows < 1 or n_cols < 1:
+    if len(row_centers) < 1 or len(col_centers) < 1:
         return candidates
 
-    # Compute uniform cell size: use the 75th percentile of detected sizes
-    # (larger than median to avoid clipping edges)
+    # Uniform cell size: 75th percentile (slightly larger to avoid clipping edges)
     widths = np.array([c[2] for c in candidates])
     heights = np.array([c[3] for c in candidates])
     cell_w = int(np.percentile(widths, 75))
     cell_h = int(np.percentile(heights, 75))
 
-    # Reconstruct grid from row/col centers with uniform size
     snapped = []
     for ry in row_centers:
         for cx_val in col_centers:
@@ -256,63 +210,219 @@ def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int
     return snapped
 
 
-def _detect_chambers_in_region(gray: np.ndarray, region: Tuple[int, int, int, int],
-                                padding: int = 15) -> List[Tuple[int, int, int, int]]:
-    """Detect individual chambers within a grid region.
-    Uses contour detection to find chamber candidates, then snaps them to a
-    regular grid to ensure full edge coverage. Coordinates returned in full-frame space."""
-    rx, ry, rw, rh = region
-    roi = gray[ry:ry+rh, rx:rx+rw]
-    roi_h, roi_w = roi.shape[:2]
-    roi_area = roi_h * roi_w
+def _grid_score(chambers: List[Tuple[int, int, int, int]]) -> float:
+    """Score how grid-like a set of chamber detections is.
+    Higher is better. Considers count, size consistency, and row/col regularity."""
+    n = len(chambers)
+    if n < 2:
+        return float(n)
 
-    blurred = cv2.GaussianBlur(roi, (5, 5), 0)
-    _, bin_img = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    areas = np.array([c[2] * c[3] for c in chambers])
+    median_a = np.median(areas)
+    if median_a == 0:
+        return 0.0
+    # Coefficient of variation of areas (lower = more consistent)
+    cv = np.std(areas) / median_a
+    size_score = max(0, 1.0 - cv)
 
-    # Close small tape gaps within chambers
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    bin_closed = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Check row/col regularity via center-coordinate clustering
+    cy = np.array([c[1] + c[3] / 2 for c in chambers])
+    cx = np.array([c[0] + c[2] / 2 for c in chambers])
+    median_h = np.median([c[3] for c in chambers])
+    median_w = np.median([c[2] for c in chambers])
 
-    cnts, _ = cv2.findContours(bin_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Count distinct rows and cols
+    sorted_cy = np.sort(cy)
+    n_rows = 1
+    for i in range(1, len(sorted_cy)):
+        if sorted_cy[i] - sorted_cy[i - 1] > median_h * 0.4:
+            n_rows += 1
+    sorted_cx = np.sort(cx)
+    n_cols = 1
+    for i in range(1, len(sorted_cx)):
+        if sorted_cx[i] - sorted_cx[i - 1] > median_w * 0.4:
+            n_cols += 1
+
+    # Grid regularity: how close is n to n_rows * n_cols?
+    expected = n_rows * n_cols
+    grid_regularity = min(n, expected) / max(n, expected) if expected > 0 else 0
+
+    return n * size_score * grid_regularity * (1.0 if n_rows > 1 or n_cols > 1 else 0.5)
+
+
+def _extract_contour_candidates(binary: np.ndarray, img_area: int,
+                                 min_frac: float = 0.002, max_frac: float = 0.12,
+                                 ar_lo: float = 0.3, ar_hi: float = 3.0
+                                 ) -> List[Tuple[int, int, int, int]]:
+    """Find rectangular contour candidates from a binary image, filtered by area and aspect ratio."""
+    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < img_area * min_frac or area > img_area * max_frac:
+            continue
+        x, y, cw, ch = cv2.boundingRect(c)
+        ar = float(cw) / ch if ch > 0 else 0
+        if ar < ar_lo or ar > ar_hi:
+            continue
+        candidates.append((x, y, cw, ch))
+    return candidates
+
+
+def _filter_size_outliers(candidates: List[Tuple[int, int, int, int]],
+                          lo: float = 0.3, hi: float = 3.0
+                          ) -> List[Tuple[int, int, int, int]]:
+    """Reject candidates whose area deviates too far from the median."""
+    if len(candidates) < 3:
+        return candidates
+    areas = np.array([c[2] * c[3] for c in candidates])
+    median_area = np.median(areas)
+    return [c for c, a in zip(candidates, areas) if lo * median_area < a < hi * median_area]
+
+
+def _add_padding(candidates: List[Tuple[int, int, int, int]],
+                 padding: int, img_w: int, img_h: int
+                 ) -> List[Tuple[int, int, int, int]]:
+    """Add padding to bounding boxes, clamped to image dimensions."""
+    result = []
+    for (x, y, w, h) in candidates:
+        px = max(0, x - padding)
+        py = max(0, y - padding)
+        pw = min(img_w - px, w + 2 * padding)
+        ph = min(img_h - py, h + 2 * padding)
+        result.append((px, py, pw, ph))
+    return result
+
+
+def _strategy_direct_bright(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Strategy 1: Detect individual bright chambers directly on the full image.
+    Works for white/bright chambers on a dark background (the most common arena type)."""
+    h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # If bright pixels dominate (>60%), chambers are likely the dark regions; invert.
+    white_ratio = np.count_nonzero(binary) / img_area
+    if white_ratio > 0.6:
+        binary = cv2.bitwise_not(binary)
+
+    # Light opening to cleanly separate adjacent chambers connected by thin noise bridges.
+    # Use a small kernel so we break inter-chamber bridges but keep intra-chamber content.
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k_open, iterations=2)
+
+    # Small closing to fill tiny holes within a single chamber (tape marks, X-marks)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k_close, iterations=1)
+
+    candidates = _extract_contour_candidates(binary, img_area)
+    candidates = _filter_size_outliers(candidates)
+    if len(candidates) >= 4:
+        candidates = _snap_to_grid(candidates)
+    return candidates
+
+
+def _strategy_adaptive_threshold(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Strategy 2: Adaptive thresholding for arenas with uneven illumination."""
+    h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Block size proportional to image but capped; must be odd
+    block = max(31, min(w_img // 8, h_img // 8)) | 1
+    binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, block, -5)
+
+    white_ratio = np.count_nonzero(binary) / img_area
+    if white_ratio > 0.6:
+        binary = cv2.bitwise_not(binary)
+
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k_open, iterations=2)
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k_close, iterations=1)
+
+    candidates = _extract_contour_candidates(binary, img_area)
+    candidates = _filter_size_outliers(candidates)
+    if len(candidates) >= 4:
+        candidates = _snap_to_grid(candidates)
+    return candidates
+
+
+def _strategy_multi_threshold(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Strategy 3: Try multiple fixed thresholds and pick the one yielding the best grid."""
+    h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    best_candidates = []
+    best_score = 0.0
+
+    # Sweep several thresholds in the bright range (chambers are white)
+    for thresh_val in range(80, 220, 20):
+        _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+
+        white_ratio = np.count_nonzero(binary) / img_area
+        if white_ratio > 0.6:
+            binary = cv2.bitwise_not(binary)
+        if white_ratio < 0.01:
+            continue
+
+        k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k_open, iterations=2)
+
+        candidates = _extract_contour_candidates(binary, img_area)
+        candidates = _filter_size_outliers(candidates)
+
+        if len(candidates) >= 4:
+            snapped = _snap_to_grid(candidates)
+            score = _grid_score(snapped)
+            if score > best_score:
+                best_score = score
+                best_candidates = snapped
+
+    return best_candidates
+
+
+def _strategy_edge_based(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Strategy 4: Use Canny edges + dilation to find enclosed rectangular regions."""
+    h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+
+    # Dilate edges to close small gaps in chamber boundaries
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, k_dilate, iterations=2)
+
+    # Flood fill from the edges to find enclosed regions
+    # Invert so enclosed (non-edge) regions become white
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
     for c in cnts:
         area = cv2.contourArea(c)
-        # Chamber should be between 0.5% and 25% of the grid region
-        if area < roi_area * 0.005 or area > roi_area * 0.25:
+        if area < img_area * 0.002 or area > img_area * 0.12:
             continue
         x, y, cw, ch = cv2.boundingRect(c)
         ar = float(cw) / ch if ch > 0 else 0
-        if ar < 0.4 or ar > 2.5:
+        if ar < 0.3 or ar > 3.0:
+            continue
+        # Rectangularity check: contour area vs bounding box area
+        rect_ratio = area / (cw * ch) if cw * ch > 0 else 0
+        if rect_ratio < 0.4:
             continue
         candidates.append((x, y, cw, ch))
 
-    if not candidates:
-        return []
-
-    # --- Grid structure validation ---
-    # Filter by size consistency: reject outliers (hands, debris)
-    areas = np.array([c[2] * c[3] for c in candidates])
-    median_area = np.median(areas)
-    candidates = [c for c, a in zip(candidates, areas) if 0.4 * median_area < a < 2.5 * median_area]
-
-    if not candidates:
-        return []
-
-    # Snap to a regular grid for uniform, edge-inclusive boxes
-    candidates = _snap_to_grid(candidates)
-
-    # Apply padding and convert to full-frame coordinates
-    full_h, full_w = gray.shape[:2]
-    result = []
-    for (x, y, cw, ch) in candidates:
-        fx = max(0, rx + x - padding)
-        fy = max(0, ry + y - padding)
-        fw = min(full_w - fx, cw + 2 * padding)
-        fh = min(full_h - fy, ch + 2 * padding)
-        result.append((fx, fy, fw, fh))
-
-    return result
+    candidates = _filter_size_outliers(candidates)
+    if len(candidates) >= 4:
+        candidates = _snap_to_grid(candidates)
+    return candidates
 
 
 def _sort_reading_order(chambers: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
@@ -328,14 +438,14 @@ def _sort_reading_order(chambers: List[Tuple[int, int, int, int]]) -> List[Tuple
 
 def detect_chambers(frame: np.ndarray, padding: int = 15,
                     video_path: Optional[str] = None) -> List[Tuple[int, int, int, int]]:
-    """Adaptive chamber detection that handles single or multiple grid panels.
+    """Adaptive chamber detection using multiple strategies with automatic selection.
 
-    Algorithm:
-    1. Optionally use median of multiple video frames for occlusion robustness.
-    2. Detect large grid regions (one or two panels).
-    3. Within each grid, detect individual chambers.
-    4. Validate by size consistency to reject transient objects (hands, shadows).
-    5. Sort in reading order: grids left-to-right, chambers top-to-bottom within each grid.
+    Tries four detection approaches and picks the result that yields the most
+    grid-like arrangement of chambers:
+      1. Direct bright-region detection (Otsu on full image)
+      2. Adaptive thresholding (handles uneven illumination)
+      3. Multi-threshold sweep (tries many fixed thresholds)
+      4. Canny edge-based detection (finds enclosed rectangles)
 
     Parameters
     ----------
@@ -343,7 +453,6 @@ def detect_chambers(frame: np.ndarray, padding: int = 15,
     padding : Extra pixels around each detected chamber.
     video_path : If provided, samples multiple frames for a stable reference.
     """
-    # Use multi-frame median if video path available (robustness to hands/occlusions)
     stable = None
     if video_path is not None:
         stable = _get_stable_frame(video_path)
@@ -354,19 +463,34 @@ def detect_chambers(frame: np.ndarray, padding: int = 15,
     else:
         gray = work_frame
 
-    # Step 1: Find grid regions
-    grids = _find_grid_regions(gray)
+    h_img, w_img = gray.shape[:2]
 
-    # Fallback: if no grid regions found, treat the whole frame as one grid
-    if not grids:
-        h_img, w_img = gray.shape[:2]
-        grids = [(0, 0, w_img, h_img)]
+    # Run all strategies and collect results
+    strategies = [
+        ("direct_bright", _strategy_direct_bright),
+        ("adaptive_thresh", _strategy_adaptive_threshold),
+        ("multi_threshold", _strategy_multi_threshold),
+        ("edge_based", _strategy_edge_based),
+    ]
 
-    # Step 2: Detect chambers within each grid
-    all_chambers = []
-    for grid in grids:
-        chambers = _detect_chambers_in_region(gray, grid, padding)
-        chambers = _sort_reading_order(chambers)
-        all_chambers.extend(chambers)
+    best_chambers = []
+    best_score = -1.0
 
-    return all_chambers
+    for name, strategy_fn in strategies:
+        try:
+            chambers = strategy_fn(gray)
+            if chambers:
+                score = _grid_score(chambers)
+                if score > best_score:
+                    best_score = score
+                    best_chambers = chambers
+        except Exception:
+            continue
+
+    if not best_chambers:
+        return []
+
+    # Apply padding and clamp to image bounds
+    best_chambers = _add_padding(best_chambers, padding, w_img, h_img)
+
+    return _sort_reading_order(best_chambers)
