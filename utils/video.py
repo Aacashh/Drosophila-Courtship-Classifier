@@ -154,6 +154,194 @@ def _get_stable_frame(video_path: str, n_samples: int = 5) -> Optional[np.ndarra
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
+def _smooth_1d(arr: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smooth a 1D array using cv2 (avoids scipy import)."""
+    k = int(sigma * 6) | 1  # kernel size, must be odd
+    if k < 3:
+        k = 3
+    return cv2.GaussianBlur(arr.reshape(1, -1).astype(np.float64),
+                            (k, 1), sigma).ravel()
+
+
+def _find_projection_intervals(proj: np.ndarray, min_width: int
+                                ) -> List[Tuple[int, int]]:
+    """Find above-threshold contiguous runs in a 1D projection profile.
+
+    Sweeps many threshold fractions and picks the set of intervals that
+    maximizes count * size-consistency.  This avoids locking onto a single
+    threshold that merges adjacent chambers.
+    """
+    lo, hi = float(np.min(proj)), float(np.max(proj))
+    if hi - lo < 1:
+        return []
+
+    best: List[Tuple[int, int]] = []
+    best_score = 0.0
+
+    # Fine sweep: 12 thresholds from 10% to 65% of the range
+    for frac_10x in range(10, 66, 5):
+        frac = frac_10x / 100.0
+        threshold = lo + (hi - lo) * frac
+        above = proj > threshold
+        padded = np.concatenate(([False], above, [False]))
+        diff = np.diff(padded.astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+
+        intervals = [(int(s), int(e)) for s, e in zip(starts, ends)
+                      if e - s >= min_width]
+
+        if len(intervals) < 2:
+            continue
+
+        # Filter by size consistency
+        sizes = np.array([e - s for s, e in intervals])
+        med = float(np.median(sizes))
+        consistent = [(s, e) for s, e in intervals
+                      if 0.5 * med < (e - s) < 2.0 * med]
+
+        if len(consistent) < 2:
+            continue
+
+        # Score = count * (1 - coefficient_of_variation)
+        sizes_c = np.array([e - s for s, e in consistent], dtype=float)
+        cv = float(np.std(sizes_c) / np.mean(sizes_c)) if np.mean(sizes_c) > 0 else 1.0
+        score = len(consistent) * max(0.0, 1.0 - cv)
+
+        if score > best_score:
+            best_score = score
+            best = consistent
+
+    return best
+
+
+def _regularize_intervals(intervals: List[Tuple[int, int]]
+                           ) -> List[Tuple[int, int]]:
+    """Make all intervals the same size, centered on their midpoints."""
+    if len(intervals) < 2:
+        return intervals
+    uniform = int(np.median([e - s for s, e in intervals]))
+    result = []
+    for s, e in intervals:
+        mid = (s + e) / 2.0
+        ns = int(mid - uniform / 2)
+        result.append((ns, ns + uniform))
+    return result
+
+
+def _strategy_projection(gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Detect chambers by projecting image intensity along rows and columns.
+
+    The dark dividers between chambers create valleys in the projection profiles.
+    Peaks between valleys correspond to chamber rows / columns.  This approach
+    is immune to X-marks, tape, and partial occlusions because it operates on
+    aggregate row/column statistics rather than individual blob contours.
+
+    Tries multiple smoothing levels and picks the combination that yields the
+    most grid-like result.
+    """
+    h_img, w_img = gray.shape[:2]
+
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, binary = cv2.threshold(blurred, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    white_ratio = np.count_nonzero(binary) / (h_img * w_img)
+    if white_ratio > 0.6:
+        binary = cv2.bitwise_not(binary)
+
+    min_col_w = max(10, w_img // 30)
+    min_row_h = max(10, h_img // 30)
+
+    # Raw projection profiles (before smoothing)
+    v_raw = np.sum(binary > 0, axis=0).astype(np.float64)
+    h_raw = np.sum(binary > 0, axis=1).astype(np.float64)
+
+    best_chambers: List[Tuple[int, int, int, int]] = []
+    best_score = 0.0
+
+    # Try multiple smoothing levels — small sigma preserves narrow dividers,
+    # large sigma bridges noise within a single chamber.  Row and column
+    # axes are swept independently so different divider widths are handled.
+    sigmas = [max(2, int(dim * f)) for dim in (w_img, h_img)
+              for f in (0.002, 0.004, 0.007, 0.012)]
+    # Deduplicate and sort
+    sigma_set = sorted(set(sigmas))
+
+    for v_sigma in sigma_set:
+        v_proj = _smooth_1d(v_raw, v_sigma)
+        col_ints = _find_projection_intervals(v_proj, min_col_w)
+        if len(col_ints) < 1:
+            continue
+
+        for h_sigma in sigma_set:
+            h_proj = _smooth_1d(h_raw, h_sigma)
+            row_ints = _find_projection_intervals(h_proj, min_row_h)
+            if len(row_ints) < 1:
+                continue
+
+            col_reg = _regularize_intervals(col_ints)
+            row_reg = _regularize_intervals(row_ints)
+
+            chambers: List[Tuple[int, int, int, int]] = []
+            for rs, re in row_reg:
+                for cs, ce in col_reg:
+                    cw, ch = ce - cs, re - rs
+                    if cw > 0 and ch > 0:
+                        chambers.append((cs, rs, cw, ch))
+
+            # Validate: reject cells that don't actually contain chamber content
+            chambers = _validate_cells(chambers, binary)
+
+            score = _grid_score(chambers)
+            if score > best_score:
+                best_score = score
+                best_chambers = chambers
+
+    return best_chambers
+
+
+def _validate_cells(chambers: List[Tuple[int, int, int, int]],
+                    binary: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """Reject cells that lack dark borders (dividers) around them.
+
+    A real chamber is surrounded by dark dividers on all sides.  Edge
+    artifacts (arena frame, borders) lack dark dividers on at least two
+    sides.  For each cell, sample thin strips just outside its four edges
+    and count how many are predominantly dark.  Keep cells with >= 3 dark
+    borders (allowing one edge to be at the image boundary).
+    """
+    if len(chambers) < 2:
+        return chambers
+    h_img, w_img = binary.shape[:2]
+    bw = 6  # border strip width in pixels
+
+    valid = []
+    for (x, y, w, h) in chambers:
+        dark_sides = 0
+        # Left strip
+        strip = binary[max(0, y):min(h_img, y + h), max(0, x - bw):x]
+        if strip.size == 0 or np.count_nonzero(strip) / max(1, strip.size) < 0.3:
+            dark_sides += 1
+        # Right strip
+        strip = binary[max(0, y):min(h_img, y + h), x + w:min(w_img, x + w + bw)]
+        if strip.size == 0 or np.count_nonzero(strip) / max(1, strip.size) < 0.3:
+            dark_sides += 1
+        # Top strip
+        strip = binary[max(0, y - bw):y, max(0, x):min(w_img, x + w)]
+        if strip.size == 0 or np.count_nonzero(strip) / max(1, strip.size) < 0.3:
+            dark_sides += 1
+        # Bottom strip
+        strip = binary[y + h:min(h_img, y + h + bw), max(0, x):min(w_img, x + w)]
+        if strip.size == 0 or np.count_nonzero(strip) / max(1, strip.size) < 0.3:
+            dark_sides += 1
+
+        if dark_sides >= 3:
+            valid.append((x, y, w, h))
+
+    return valid
+
+
 def _snap_to_grid(candidates: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
     """Given rough chamber detections, infer a regular grid and snap boxes to it.
     Cell sizes are constrained by center-to-center spacing so boxes never overlap."""
@@ -511,13 +699,22 @@ def detect_chambers(frame: np.ndarray, padding: int = 15,
 
     h_img, w_img = gray.shape[:2]
 
-    # Run all strategies and collect results
+    # Run all strategies and collect results.
+    # Projection-based is first (most robust for grid arenas).
     strategies = [
+        ("projection", _strategy_projection),
         ("direct_bright", _strategy_direct_bright),
         ("adaptive_thresh", _strategy_adaptive_threshold),
         ("multi_threshold", _strategy_multi_threshold),
         ("edge_based", _strategy_edge_based),
     ]
+
+    # Binary image for cell validation (computed once, shared across strategies)
+    blurred_val = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, binary_val = cv2.threshold(blurred_val, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.count_nonzero(binary_val) / (h_img * w_img) > 0.6:
+        binary_val = cv2.bitwise_not(binary_val)
 
     best_chambers = []
     best_score = -1.0
@@ -526,6 +723,8 @@ def detect_chambers(frame: np.ndarray, padding: int = 15,
         try:
             chambers = strategy_fn(gray)
             if chambers:
+                # Validate BEFORE scoring so false positives reduce the score
+                chambers = _validate_cells(chambers, binary_val)
                 score = _grid_score(chambers)
                 if score > best_score:
                     best_score = score
