@@ -21,7 +21,7 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-from utils.video import detect_chambers, crop_video, stabilize_video
+from utils.video import detect_chambers, crop_video, stabilize_video, find_best_detection_frame
 from tracking.tracker import track_two_flies
 from tracking.features import build_feature_matrix
 from classification.jab_parser import load_jab_models
@@ -514,27 +514,35 @@ def _run_analysis():
         if not ret:
             st.error("Could not read video.")
             return
-            
+
+        # Get the detection frame (after divider removal) for both
+        # detection and visualization — camera may shift during setup
+        if 'detection_frame' not in st.session_state:
+            det_frame = find_best_detection_frame(video_path)
+            st.session_state.detection_frame = det_frame if det_frame is not None else first_frame
+
         st.subheader("1. Chamber Detection")
         col1, col2 = st.columns([2, 1])
-        
+
         with col1:
             # ROI Editing state
             if 'rois' not in st.session_state:
-                st.session_state.rois = detect_chambers(first_frame, video_path=video_path)
-                
+                st.session_state.rois = detect_chambers(st.session_state.detection_frame, video_path=None)
+
             # --- Interactive Grid Adjustment ---
             st.write("### Fine-tune Detection")
             if st.button("Re-run Auto Detection"):
-                st.session_state.rois = detect_chambers(first_frame, video_path=video_path)
+                det_frame = find_best_detection_frame(video_path)
+                st.session_state.detection_frame = det_frame if det_frame is not None else first_frame
+                st.session_state.rois = detect_chambers(st.session_state.detection_frame, video_path=None)
                 st.rerun()
 
-            # Display current ROIs
-            frame_viz = first_frame.copy()
+            # Display current ROIs on the detection frame (not first frame)
+            frame_viz = st.session_state.detection_frame.copy()
             for i, (x, y, w, h) in enumerate(st.session_state.rois):
                 cv2.rectangle(frame_viz, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 cv2.putText(frame_viz, f"#{i}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                
+
             st.image(cv2.cvtColor(frame_viz, cv2.COLOR_BGR2RGB), caption="Detected Chambers", use_container_width=True)
             
         with col2:

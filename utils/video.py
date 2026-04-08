@@ -154,315 +154,146 @@ def _get_stable_frame(video_path: str, n_samples: int = 5) -> Optional[np.ndarra
     return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def _cluster_1d(values: np.ndarray, min_gap: float) -> List[float]:
-    """Cluster sorted 1D values into groups separated by at least min_gap.
-    Returns the mean of each cluster."""
-    if len(values) == 0:
-        return []
-    sorted_vals = np.sort(values)
-    clusters: List[List[float]] = [[float(sorted_vals[0])]]
-    for v in sorted_vals[1:]:
-        if v - clusters[-1][-1] > min_gap:
-            clusters.append([float(v)])
-        else:
-            clusters[-1].append(float(v))
-    return [float(np.mean(c)) for c in clusters]
+def find_best_detection_frame(video_path: str,
+                              start_sec: float = 90,
+                              end_sec: float = 300,
+                              step_sec: float = 5) -> Optional[np.ndarray]:
+    """Find the best frame for chamber detection by sampling after divider removal.
 
+    Scans frames from start_sec to end_sec, picks the one with the most
+    chamber-sized bright blobs (dividers already removed, arena fully visible).
+    Returns a median-composite of nearby frames for noise reduction.
 
-def _find_chamber_contours(gray: np.ndarray
-                           ) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """Find bright rectangular chamber blobs using Otsu + fallback thresholds.
-
-    Returns list of (contour, bounding_rect) pairs for chamber-sized regions.
-    Tries Otsu first, then sweeps fixed thresholds if Otsu finds too few.
+    Parameters
+    ----------
+    video_path : Path to the video file.
+    start_sec  : Earliest time to sample (well after dividers removed, ~90s).
+    end_sec    : Latest time to sample.
+    step_sec   : Interval between samples.
     """
-    h_img, w_img = gray.shape[:2]
-    img_area = h_img * w_img
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    duration = total / fps
+    if total < 1:
+        cap.release()
+        return None
 
-    def _extract(binary: np.ndarray):
-        # Ensure chambers are the white regions
-        if np.count_nonzero(binary) / img_area > 0.6:
-            binary = cv2.bitwise_not(binary)
-        # Open to separate touching chambers, close to fill small holes
-        k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k3, iterations=2)
-        k5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k5, iterations=1)
+    start = min(start_sec, duration * 0.15)
+    end = min(end_sec, duration * 0.8)
 
-        cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-        results = []
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area < img_area * 0.003 or area > img_area * 0.15:
-                continue
-            x, y, cw, ch = cv2.boundingRect(c)
-            ar = cw / ch if ch > 0 else 0
-            if ar < 0.3 or ar > 3.0:
-                continue
-            # Rectangularity: reject irregular blobs (border artifacts)
-            rect_area = cw * ch
-            if rect_area > 0 and area / rect_area < 0.5:
-                continue
-            results.append((c, (x, y, cw, ch)))
-        return results
+    best_count = 0
+    best_t = start
 
-    # Try Otsu first
-    _, binary = cv2.threshold(blurred, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    candidates = _extract(binary)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
-    # Filter size outliers
-    if len(candidates) >= 3:
-        areas = np.array([r[2] * r[3] for _, r in candidates])
-        med = np.median(areas)
-        candidates = [(c, r) for (c, r), a in zip(candidates, areas)
-                      if 0.4 * med < a < 2.5 * med]
-
-    if len(candidates) >= 4:
-        return candidates
-
-    # Fallback: sweep fixed thresholds and pick the one with most chambers
-    best = candidates
-    for thresh in range(60, 220, 15):
-        _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
-        cands = _extract(binary)
-        if len(cands) >= 3:
-            areas = np.array([r[2] * r[3] for _, r in cands])
-            med = np.median(areas)
-            cands = [(c, r) for (c, r), a in zip(cands, areas)
-                     if 0.3 * med < a < 3.0 * med]
-        if len(cands) > len(best):
-            best = cands
-
-    return best
-
-
-def _detect_grid_angle(contours: List[np.ndarray]) -> float:
-    """Detect grid rotation angle from the median orientation of chamber contours.
-
-    Uses cv2.minAreaRect on each contour.  The angle is normalized to [-45, 45)
-    degrees and converted to radians.
-    """
-    if len(contours) < 2:
-        return 0.0
-
-    angles_deg = []
-    for c in contours:
-        if len(c) < 5:
+    t = start
+    while t < end:
+        idx = int(t * fps)
+        if idx >= total:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            t += step_sec
             continue
-        rect = cv2.minAreaRect(c)
-        w_r, h_r = rect[1]
-        a = rect[2]  # degrees in [-90, 0)
-        # minAreaRect angle convention: if width < height, add 90 to get
-        # the angle of the long side relative to horizontal
-        if w_r < h_r:
-            a += 90.0
-        # Normalize to [-45, 45)
-        while a > 45.0:
-            a -= 90.0
-        while a < -45.0:
-            a += 90.0
-        angles_deg.append(a)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        img_area = h * w
 
-    if not angles_deg:
-        return 0.0
+        _, binary = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        eroded = cv2.erode(binary, k, iterations=2)
+        recovered = cv2.dilate(eroded, k, iterations=2)
+        cnts, _ = cv2.findContours(recovered, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        count = sum(1 for c in cnts
+                    if img_area * 0.002 < cv2.contourArea(c) < img_area * 0.08)
+        if count > best_count:
+            best_count = count
+            best_t = t
+        t += step_sec
 
-    median_deg = float(np.median(angles_deg))
-    # Ignore tiny angles (< 1°) — likely just noise
-    if abs(median_deg) < 1.0:
-        return 0.0
-    return np.deg2rad(median_deg)
+    # Median of 7 frames around the best time for noise reduction
+    nearby = np.linspace(max(0, best_t * fps - fps * 3),
+                         min(total - 1, best_t * fps + fps * 3),
+                         7, dtype=int)
+    frames = []
+    for idx in nearby:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, f = cap.read()
+        if ret:
+            frames.append(f.astype(np.float32))
+    cap.release()
+
+    if not frames:
+        return None
+    return np.median(np.stack(frames), axis=0).astype(np.uint8)
 
 
-def _fit_grid(centers: np.ndarray, angle: float,
-              median_w: float, median_h: float,
-              img_w: int, img_h: int,
-              gray: Optional[np.ndarray] = None) -> List[Tuple[int, int, int, int]]:
-    """Fit a regular grid to detected chamber centers, accounting for rotation.
+def _detect_blobs(binary: np.ndarray, img_area: int,
+                  kernel_size: int, iterations: int
+                  ) -> List[Tuple[int, int, int, int, float]]:
+    """Run erode→dilate on a binary image and return chamber-shaped blobs.
 
-    1. Rotate centers to axis-aligned coordinate system
-    2. Cluster x/y into columns/rows
-    3. Compute cell size from center-to-center spacing
-    4. Generate uniform grid cells
-    5. Validate each cell has a detected center nearby (reject phantom cells)
-    6. Rotate back and return axis-aligned bounding boxes
+    Returns list of (x, y, w, h, area) for blobs passing size/shape filters.
     """
-    n = len(centers)
-    if n < 2:
-        return [(int(c[0] - median_w / 2), int(c[1] - median_h / 2),
-                 int(median_w), int(median_h)) for c in centers]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (kernel_size, kernel_size))
+    eroded = cv2.erode(binary, k, iterations=iterations)
+    recovered = cv2.dilate(eroded, k, iterations=iterations)
 
-    # Rotate centers to axis-aligned space around centroid
-    centroid = np.mean(centers, axis=0)
-    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
-    rot_fwd = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-    rotated = (centers - centroid) @ rot_fwd.T
+    cnts, _ = cv2.findContours(recovered, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < img_area * 0.002 or area > img_area * 0.08:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        ar = bw / bh if bh > 0 else 0
+        if ar < 0.5 or ar > 2.0:
+            continue
+        rect_fill = area / (bw * bh) if bw * bh > 0 else 0
+        if rect_fill < 0.45:
+            continue
+        candidates.append((x, y, bw, bh, area))
 
-    # Cluster into columns and rows
-    col_centers = _cluster_1d(rotated[:, 0], median_w * 0.4)
-    row_centers = _cluster_1d(rotated[:, 1], median_h * 0.4)
+    # Remove area outliers — all chambers should be nearly the same size
+    if len(candidates) >= 4:
+        areas = np.array([c[4] for c in candidates])
+        med = np.median(areas)
+        candidates = [c for c in candidates if 0.4 * med < c[4] < 2.0 * med]
 
-    if not col_centers or not row_centers:
-        return [(int(c[0] - median_w / 2), int(c[1] - median_h / 2),
-                 int(median_w), int(median_h)) for c in centers]
-
-    # Regularize: make column/row centers evenly spaced
-    col_centers = sorted(col_centers)
-    row_centers = sorted(row_centers)
-
-    if len(col_centers) >= 2:
-        col_spacing = float(np.median(np.diff(col_centers)))
-        col_start = col_centers[0]
-        col_centers = [col_start + i * col_spacing
-                       for i in range(len(col_centers))]
-    else:
-        col_spacing = median_w
-    if len(row_centers) >= 2:
-        row_spacing = float(np.median(np.diff(row_centers)))
-        row_start = row_centers[0]
-        row_centers = [row_start + i * row_spacing
-                       for i in range(len(row_centers))]
-    else:
-        row_spacing = median_h
-
-    # Cell size from spacing (prevents overlap) or from contour size
-    cell_w = int(min(col_spacing - 4, median_w))
-    cell_h = int(min(row_spacing - 4, median_h))
-
-    # Safety floor
-    cell_w = max(cell_w, int(median_w * 0.5))
-    cell_h = max(cell_h, int(median_h * 0.5))
-
-    # Precompute Otsu threshold for brightness validation
-    otsu_thresh = 128.0
-    if gray is not None:
-        otsu_thresh = float(cv2.threshold(gray, 0, 255,
-                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
-
-    # Generate grid and rotate back
-    cos_b, sin_b = np.cos(angle), np.sin(angle)
-    rot_back = np.array([[cos_b, -sin_b], [sin_b, cos_b]])
-
-    chambers = []
-    for ry in row_centers:
-        for rx in col_centers:
-            pt = np.array([rx, ry]) @ rot_back.T + centroid
-            x = int(round(pt[0] - cell_w / 2))
-            y = int(round(pt[1] - cell_h / 2))
-            # Clamp to image bounds
-            x = max(0, min(x, img_w - cell_w))
-            y = max(0, min(y, img_h - cell_h))
-
-            # Validate: check that the cell region is bright enough to be
-            # a real chamber (rejects phantom cells at image borders)
-            if gray is not None:
-                cx1 = x + cell_w // 4
-                cy1 = y + cell_h // 4
-                cx2 = min(x + 3 * cell_w // 4, img_w)
-                cy2 = min(y + 3 * cell_h // 4, img_h)
-                region = gray[cy1:cy2, cx1:cx2]
-                if region.size > 0:
-                    bright_frac = np.count_nonzero(region > otsu_thresh) / region.size
-                    if bright_frac < 0.2:
-                        continue
-
-            chambers.append((x, y, cell_w, cell_h))
-
-    return chambers
+    return candidates
 
 
-def _add_padding(candidates: List[Tuple[int, int, int, int]],
-                 padding: int, img_w: int, img_h: int
-                 ) -> List[Tuple[int, int, int, int]]:
-    """Add padding to bounding boxes, clamped to image dimensions and
-    limited so adjacent boxes never overlap."""
-    if not candidates or padding <= 0:
-        return candidates
-
-    # Max safe padding from center-to-center spacing
-    centers_x = sorted(set(c[0] + c[2] / 2 for c in candidates))
-    centers_y = sorted(set(c[1] + c[3] / 2 for c in candidates))
-    median_w = np.median([c[2] for c in candidates])
-    median_h = np.median([c[3] for c in candidates])
-
-    max_pad_x = padding
-    max_pad_y = padding
-    if len(centers_x) >= 2:
-        min_gap_x = min(centers_x[i + 1] - centers_x[i]
-                        for i in range(len(centers_x) - 1))
-        available_x = (min_gap_x - median_w) / 2
-        max_pad_x = max(0, int(min(padding, available_x - 1)))
-    if len(centers_y) >= 2:
-        min_gap_y = min(centers_y[i + 1] - centers_y[i]
-                        for i in range(len(centers_y) - 1))
-        available_y = (min_gap_y - median_h) / 2
-        max_pad_y = max(0, int(min(padding, available_y - 1)))
-
-    result = []
-    for (x, y, w, h) in candidates:
-        px = max(0, x - max_pad_x)
-        py = max(0, y - max_pad_y)
-        pw = min(img_w - px, w + 2 * max_pad_x)
-        ph = min(img_h - py, h + 2 * max_pad_y)
-        result.append((px, py, pw, ph))
-    return result
-
-
-def _sort_reading_order(chambers: List[Tuple[int, int, int, int]],
-                        angle: float = 0.0) -> List[Tuple[int, int, int, int]]:
-    """Sort chambers in reading order (top-to-bottom, left-to-right).
-
-    If the grid is rotated, transforms centers into the grid's own coordinate
-    system before sorting so that rows/columns are identified correctly.
-    """
-    if not chambers:
-        return chambers
-    if abs(angle) < 0.001:
-        # No rotation — simple row-binning sort
-        heights = [r[3] for r in chambers]
-        bin_size = max(np.median(heights) * 0.7, 1)
-        return sorted(chambers, key=lambda r: (int(r[1] / bin_size), r[0]))
-
-    # Rotate centers to axis-aligned space, sort there, map back
-    centers = np.array([[c[0] + c[2] / 2, c[1] + c[3] / 2] for c in chambers])
-    centroid = np.mean(centers, axis=0)
-    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
-    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-    rotated = (centers - centroid) @ rot.T
-
-    median_h = np.median([c[3] for c in chambers])
-    bin_size = max(median_h * 0.7, 1)
-
-    indices = list(range(len(chambers)))
-    indices.sort(key=lambda i: (int(rotated[i, 1] / bin_size), rotated[i, 0]))
-    return [chambers[i] for i in indices]
-
-
-def detect_chambers(frame: np.ndarray, padding: int = 15,
+def detect_chambers(frame: np.ndarray, padding: int = 20,
                     video_path: Optional[str] = None) -> List[Tuple[int, int, int, int]]:
     """Detect chambers in a multi-chamber arena image.
 
     Pipeline:
-      1. Get a stable reference frame (median of several frames)
-      2. Find bright rectangular blobs (chamber candidates)
-      3. Detect grid rotation from contour orientations
-      4. Fit a regular grid to the detected centers
-      5. Add padding, sort in reading order
-
-    Handles different grid sizes, aspect ratios, and small rotations.
+      1. Get the best detection frame (after divider removal, ~60s+)
+      2. Otsu threshold to find bright regions
+      3. Adaptive erosion: try multiple kernel sizes, pick the one that
+         finds the most chamber-sized blobs (handles varying divider thickness)
+      4. Filter by area / aspect ratio / rectangularity
+      5. Remove area outliers, add padding, sort in reading order
 
     Parameters
     ----------
     frame : First frame of the video (used as fallback).
     padding : Extra pixels around each detected chamber.
-    video_path : If provided, samples multiple frames for a stable reference.
+    video_path : If provided, finds the best detection frame automatically.
     """
-    stable = None
+    # Use best detection frame if video is available, else fall back to given frame
+    work_frame = frame
     if video_path is not None:
-        stable = _get_stable_frame(video_path)
-    work_frame = stable if stable is not None else frame
+        best = find_best_detection_frame(video_path)
+        if best is not None:
+            work_frame = best
 
     if len(work_frame.shape) == 3:
         gray = cv2.cvtColor(work_frame, cv2.COLOR_BGR2GRAY)
@@ -470,27 +301,36 @@ def detect_chambers(frame: np.ndarray, padding: int = 15,
         gray = work_frame
 
     h_img, w_img = gray.shape[:2]
+    img_area = h_img * w_img
 
-    # Step 1: Find chamber contours
-    contour_results = _find_chamber_contours(gray)
-    if len(contour_results) < 2:
+    # Otsu threshold
+    _, binary = cv2.threshold(gray, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Adaptive erosion: try multiple kernel/iteration combos,
+    # pick the one that finds the most chamber-sized blobs.
+    # Stronger erosion separates touching chambers but may erase dim ones.
+    best_candidates = []
+    for ks, iters in [(5, 2), (7, 2), (9, 2), (7, 3), (9, 3), (11, 3)]:
+        cands = _detect_blobs(binary, img_area, ks, iters)
+        if len(cands) > len(best_candidates):
+            best_candidates = cands
+
+    if not best_candidates:
         return []
 
-    contours = [c for c, _ in contour_results]
-    rects = [r for _, r in contour_results]
-    centers = np.array([[r[0] + r[2] / 2, r[1] + r[3] / 2] for r in rects])
-    median_w = float(np.median([r[2] for r in rects]))
-    median_h = float(np.median([r[3] for r in rects]))
+    # Add padding, clamped to image bounds
+    chambers = []
+    for x, y, bw, bh, _ in best_candidates:
+        px = max(0, x - padding)
+        py = max(0, y - padding)
+        pw = min(w_img - px, bw + 2 * padding)
+        ph = min(h_img - py, bh + 2 * padding)
+        chambers.append((px, py, pw, ph))
 
-    # Step 2: Detect grid rotation
-    angle = _detect_grid_angle(contours)
+    # Sort in reading order (top-to-bottom, left-to-right)
+    if chambers:
+        med_h = np.median([c[3] for c in chambers])
+        chambers.sort(key=lambda r: (int(r[1] / (med_h * 0.5)), r[0]))
 
-    # Step 3: Fit regular grid
-    chambers = _fit_grid(centers, angle, median_w, median_h, w_img, h_img, gray)
-
-    if not chambers:
-        return []
-
-    # Step 4: Padding and sort
-    chambers = _add_padding(chambers, padding, w_img, h_img)
-    return _sort_reading_order(chambers, angle)
+    return chambers
