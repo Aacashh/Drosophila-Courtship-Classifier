@@ -42,44 +42,75 @@ def export_to_csv(output_path: Path,
         writer.writerows(rows)
 
 
-def infer_sex(bouts_by_behavior: Dict[str, List[List[Tuple[int, int]]]]) -> Dict[int, Dict[str, bool]]:
+def infer_sex(bouts_by_behavior: Dict[str, List[List[Tuple[int, int]]]],
+              tracks: Dict = None) -> Dict[int, Dict[str, bool]]:
     """
-    Infer sex based on WingExt frequency.
-    Uses a ratio-based check: the fly with >70% of total wing extension is male.
+    Infer sex using multiple signals:
+    1. WingExt frequency (male does more wing extension during courtship)
+    2. Body size (male is smaller; female is pregnant/larger)
+
+    Priority: wing extension ratio > 0.7 is decisive.
+    If ambiguous, use body size as tiebreaker (smaller fly = male).
     """
     wing_ext = bouts_by_behavior.get('WingExt', [])
-    if not wing_ext:
-        return {0: {'is_male': False, 'is_female': False},
-                1: {'is_male': False, 'is_female': False}}
+    unknown = {0: {'is_male': False, 'is_female': False},
+               1: {'is_male': False, 'is_female': False}}
 
-    durations = {}
-    for i, bouts in enumerate(wing_ext):
-        durations[i] = sum(end - start for start, end in bouts)
+    # Score: positive = more likely to be male
+    score = {0: 0.0, 1: 0.0}
 
-    stats = {}
-
-    if len(durations) >= 2:
-        d0 = durations.get(0, 0)
-        d1 = durations.get(1, 0)
+    # Signal 1: Wing extension frequency
+    if wing_ext and len(wing_ext) >= 2:
+        d0 = sum(end - start for start, end in wing_ext[0])
+        d1 = sum(end - start for start, end in wing_ext[1])
         total = d0 + d1
-
         if total > 0:
             ratio = max(d0, d1) / total
-            if ratio > 0.7:  # One fly does >70% of wing extension
+            if ratio > 0.7:
                 if d0 > d1:
-                    stats[0] = {'is_male': True, 'is_female': False}
-                    stats[1] = {'is_male': False, 'is_female': True}
+                    score[0] += 2.0
                 else:
-                    stats[1] = {'is_male': True, 'is_female': False}
-                    stats[0] = {'is_male': False, 'is_female': True}
-            else:
-                stats[0] = {'is_male': False, 'is_female': False}
-                stats[1] = {'is_male': False, 'is_female': False}
-        else:
-            stats[0] = {'is_male': False, 'is_female': False}
-            stats[1] = {'is_male': False, 'is_female': False}
+                    score[1] += 2.0
+            elif ratio > 0.55:
+                if d0 > d1:
+                    score[0] += 1.0
+                else:
+                    score[1] += 1.0
 
-    return stats
+    # Signal 2: Body size (smaller fly = male, pregnant female is larger)
+    if tracks is not None and 'a' in tracks and len(tracks['a']) >= 2:
+        import numpy as np
+        a0_valid = tracks['a'][0][~np.isnan(tracks['a'][0])]
+        a1_valid = tracks['a'][1][~np.isnan(tracks['a'][1])]
+        if len(a0_valid) > 50 and len(a1_valid) > 50:
+            med_a0 = float(np.median(a0_valid))
+            med_a1 = float(np.median(a1_valid))
+            size_ratio = min(med_a0, med_a1) / max(med_a0, med_a1) if max(med_a0, med_a1) > 0 else 1.0
+            if size_ratio < 0.85:  # Meaningful size difference
+                if med_a0 < med_a1:
+                    score[0] += 1.0  # fly 0 is smaller = more likely male
+                else:
+                    score[1] += 1.0
+
+    # Signal 3: Overall courtship behavior count (male does more)
+    for beh in ['Following', 'Circling', 'Attempted_Copulation']:
+        beh_bouts = bouts_by_behavior.get(beh, [])
+        if beh_bouts and len(beh_bouts) >= 2:
+            n0 = len(beh_bouts[0])
+            n1 = len(beh_bouts[1])
+            if n0 > n1 * 2:
+                score[0] += 0.5
+            elif n1 > n0 * 2:
+                score[1] += 0.5
+
+    # Decide
+    if score[0] > score[1] and score[0] >= 1.0:
+        return {0: {'is_male': True, 'is_female': False},
+                1: {'is_male': False, 'is_female': True}}
+    elif score[1] > score[0] and score[1] >= 1.0:
+        return {0: {'is_male': False, 'is_female': True},
+                1: {'is_male': True, 'is_female': False}}
+    return unknown
 
 
 def export_summary_csv(output_path: Path,

@@ -5,45 +5,51 @@ from scipy.ndimage import gaussian_filter1d
 from .inference import scores_to_bouts
 
 
-def smooth_score(score: np.ndarray, fps: float, sigma_s: float = 0.05) -> np.ndarray:
-    """Smooth a binary score array with a Gaussian filter, then re-threshold at 0.5.
-    Eliminates single-frame false positives."""
+def smooth_score(score: np.ndarray, fps: float, sigma_s: float = 0.2) -> np.ndarray:
+    """Smooth a binary score array with a Gaussian filter, then re-threshold.
+    Uses a wider window (0.2s) to bridge short tracking gaps and eliminate noise.
+    Lower re-threshold (0.3) to preserve bouts interrupted by brief tracking dropout."""
     sigma_frames = max(1.0, sigma_s * fps)
     smoothed = gaussian_filter1d(score.astype(float), sigma=sigma_frames)
-    return (smoothed > 0.5).astype(float)
+    return (smoothed > 0.3).astype(float)
 
 
 def compute_courtship_index(bouts_by_behavior: Dict[str, List[List[Tuple[int, int]]]],
-                            n_frames: int, fly_idx: int) -> float:
-    """Compute Courtship Index: % of frames with ANY courtship behavior for a given fly."""
+                            n_frames: int, fly_idx: int,
+                            onset_frame: int = 0) -> float:
+    """Compute Courtship Index: % of frames with ANY courtship behavior for a given fly.
+    If onset_frame > 0, only count frames from onset_frame onward (exclude setup period)."""
     courtship_frames = np.zeros(n_frames, dtype=bool)
     for beh, bouts_list in bouts_by_behavior.items():
+        if beh == 'Courtship':
+            continue  # Don't double-count the unified Courtship entry
         if fly_idx < len(bouts_list):
             for start, end in bouts_list[fly_idx]:
                 courtship_frames[start:end + 1] = True
-    valid = n_frames if n_frames > 0 else 1
-    return float(np.sum(courtship_frames)) / valid * 100.0
+    valid_frames = n_frames - onset_frame
+    valid = valid_frames if valid_frames > 0 else 1
+    return float(np.sum(courtship_frames[onset_frame:])) / valid * 100.0
 
 
 DEFAULT_PARAMS = {
-    'wing_ext_angle_deg': 60,
-    'wing_ext_min_dur_s': 1.0,
-    'cop_distance_mm': 2.0,
-    'cop_velocity_mm_s': 0.3,
-    'cop_min_dur_s': 8.0,
-    'cop_stability_mm': 0.5,
-    'follow_velocity_mm_s': 2.0,
-    'follow_facing_deg': 45,
-    'follow_dist_max_mm': 8.0,
-    'follow_dist_min_mm': 2.0,
-    'follow_min_dur_s': 1.0,
-    'circling_lat_vel_mm_s': 2.0,
+    'wing_ext_angle_deg': 55,
+    'wing_ext_min_dur_s': 0.5,
+    'cop_distance_mm': 3.0,
+    'cop_velocity_mm_s': 0.5,
+    'cop_min_dur_s': 5.0,
+    'cop_stability_mm': 1.0,
+    'follow_velocity_mm_s': 1.0,
+    'follow_facing_deg': 60,
+    'follow_dist_max_mm': 10.0,
+    'follow_dist_min_mm': 1.5,
+    'follow_min_dur_s': 0.5,
+    'circling_lat_vel_mm_s': 1.5,
     'circling_dist_mm': 10.0,
-    'circling_min_dur_s': 1.0,
-    'att_cop_nose_dist_mm': 0.5,
-    'att_cop_velocity_mm_s': 1.0,
-    'att_cop_min_dur_s': 0.5,
-    'merge_gap_s': 0.5,
+    'circling_min_dur_s': 0.5,
+    'att_cop_nose_dist_mm': 1.0,
+    'att_cop_velocity_mm_s': 0.5,
+    'att_cop_min_dur_s': 0.3,
+    'merge_gap_s': 1.5,
 }
 
 
@@ -183,5 +189,22 @@ class HeuristicClassifier:
                         filtered_bouts.append((s, e))
                         claimed[s:e + 1] = True
                 results[beh][i] = filtered_bouts
+
+        # --- Unified Courtship (union of all sub-behaviors per fly) ---
+        courtship_merge = int(p.get('courtship_merge_gap_s', 3.0) * fps)
+        courtship_min = int(p.get('courtship_min_dur_s', 0.5) * fps)
+        results['Courtship'] = [[], []]
+        for i in range(n_flies):
+            courtship_frames = np.zeros(n_frames, dtype=bool)
+            for beh in results:
+                if beh == 'Courtship':
+                    continue
+                if i < len(results[beh]):
+                    for s, e in results[beh][i]:
+                        courtship_frames[s:e+1] = True
+            courtship_score = courtship_frames.astype(float)
+            results['Courtship'][i] = scores_to_bouts(
+                courtship_score, threshold=0.0,
+                min_len=courtship_min, merge_gap=courtship_merge)
 
         return results

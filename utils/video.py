@@ -92,6 +92,87 @@ def stabilize_video(input_path: str, output_path: str, max_iter: int = 20, eps: 
     return True
 
 
+def _get_ffmpeg_exe() -> Optional[str]:
+    """Return path to ffmpeg binary, checking system PATH then imageio_ffmpeg."""
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def crop_chambers(src: Path, dst_dir: Path,
+                  rois: List[Tuple[int, int, int, int]]) -> List[Path]:
+    """Crop all chambers from a video.
+
+    Uses ffmpeg subprocess per chamber (hardware-accelerated decode, fast
+    h264 encode) if available. Falls back to single-pass OpenCV.
+    """
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {src}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+
+    ffmpeg = _get_ffmpeg_exe()
+    if ffmpeg:
+        # ffmpeg path: one subprocess per chamber, runs in parallel
+        procs = []
+        for i, (x, y, w, h) in enumerate(rois):
+            p = dst_dir / f"chamber_{i+1}.mp4"
+            paths.append(p)
+            cmd = [
+                ffmpeg, "-y",
+                "-i", str(src),
+                "-filter:v", f"crop={w}:{h}:{x}:{y}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-an",
+                str(p),
+            ]
+            procs.append(subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            print(f"  Started ffmpeg for chamber {i+1}/{len(rois)}")
+
+        # Wait for all to finish
+        for i, proc in enumerate(procs):
+            proc.wait()
+            print(f"  Chamber {i+1} done")
+
+        return paths
+
+    # OpenCV fallback: single-pass decode, slice all ROIs
+    cap = cv2.VideoCapture(str(src))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writers = []
+    for i, (_, _, w, h) in enumerate(rois):
+        p = dst_dir / f"chamber_{i+1}.mp4"
+        writers.append(cv2.VideoWriter(str(p), fourcc, fps, (w, h)))
+        paths.append(p)
+
+    n = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        for j, (x, y, w, h) in enumerate(rois):
+            writers[j].write(frame[y:y+h, x:x+w])
+        n += 1
+        if n % 1000 == 0:
+            print(f"  {n}/{total} frames")
+
+    cap.release()
+    for wr in writers:
+        wr.release()
+
+    return paths
+
+
 def crop_video(src: Path, dst: Path, roi: Tuple[int,int,int,int]) -> None:
     """Crop video to ROI (x, y, w, h). Uses ffmpeg if available, falls back to OpenCV."""
     x, y, w, h = roi

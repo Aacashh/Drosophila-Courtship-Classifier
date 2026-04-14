@@ -128,7 +128,7 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
             bouts_by_behavior = HeuristicClassifier.classify(tracks, fps, px_per_mm, params=heuristic_params)
         
         # 5. Export
-        fly_stats = infer_sex(bouts_by_behavior)
+        fly_stats = infer_sex(bouts_by_behavior, tracks=tracks)
         csv_path = output_dir / f"chamber_{i}_results.csv"
         export_to_csv(csv_path, bouts_by_behavior, fps, fly_stats)
 

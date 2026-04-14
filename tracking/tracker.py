@@ -111,21 +111,65 @@ def smooth_trajectories(tracks: Dict[str, List[np.ndarray]], sigma: float = 1.5)
 
 
 def compute_overlap_flags(tracks: Dict[str, List[np.ndarray]], n_flies: int = 2) -> np.ndarray:
-    """Flag frames where flies overlap (c2c < sum of semi-major axes)."""
+    """Flag frames where flies physically overlap (c2c < sum of semi-major axes).
+    Only flags frames where BOTH flies are tracked — missing flies are NOT overlap."""
     if n_flies < 2:
         return np.zeros(len(tracks['x'][0]), dtype=bool)
 
     x0, y0, a0 = tracks['x'][0], tracks['y'][0], tracks['a'][0]
     x1, y1, a1 = tracks['x'][1], tracks['y'][1], tracks['a'][1]
 
+    # Only check overlap when both flies are valid (not NaN)
+    both_valid = ~np.isnan(x0) & ~np.isnan(x1)
     c2c = np.hypot(x1 - x0, y1 - y0)
     body_threshold = a0 + a1  # sum of semi-major axes
-    overlap = c2c < body_threshold
-
-    # Also flag NaN frames
-    overlap = overlap | np.isnan(x0) | np.isnan(x1)
+    overlap = both_valid & (c2c < body_threshold)
 
     return overlap
+
+
+def _try_split_contour(contour, thresh_img: np.ndarray, min_area: float) -> Optional[List]:
+    """Try to split a merged contour into two using distance transform + watershed."""
+    # Create a mask for this contour only
+    mask = np.zeros_like(thresh_img)
+    cv2.drawContours(mask, [contour], -1, 255, -1)
+
+    # Distance transform
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    if dist.max() == 0:
+        return None
+
+    # Find peaks (local maxima) = likely fly centers
+    _, sure_fg = cv2.threshold(dist, 0.4 * dist.max(), 255, 0)
+    sure_fg = sure_fg.astype(np.uint8)
+
+    # Find connected components in the peaks
+    n_labels, labels = cv2.connectedComponents(sure_fg)
+    if n_labels < 3:  # background + 2 flies needed
+        return None
+
+    # Use watershed to split
+    markers = labels.copy().astype(np.int32)
+    markers[mask == 0] = 0
+    # Watershed needs a 3-channel image
+    img_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    markers = cv2.watershed(img_3ch, markers)
+
+    # Extract contours from each label
+    split_contours = []
+    for label_id in range(1, n_labels):
+        region = np.zeros_like(mask)
+        region[markers == label_id] = 255
+        sub_cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for sc in sub_cnts:
+            if cv2.contourArea(sc) > min_area:
+                split_contours.append(sc)
+
+    if len(split_contours) >= 2:
+        # Sort by area, take top 2
+        split_contours = sorted(split_contours, key=cv2.contourArea, reverse=True)[:2]
+        return split_contours
+    return None
 
 
 def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.ndarray]]:
@@ -161,6 +205,10 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
+    # Track median fly area for merged-contour splitting
+    recent_fly_areas: List[float] = []
+    median_fly_area = 0.0
+
     frame_idx = 0
 
     while True:
@@ -182,6 +230,16 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
         min_area = (width * height) * 0.0005
         valid_cnts = [c for c in cnts if cv2.contourArea(c) > min_area]
         valid_cnts = sorted(valid_cnts, key=cv2.contourArea, reverse=True)[:n_flies]
+
+        # --- Split merged contours ---
+        # If only 1 contour found and it's much larger than expected,
+        # try to split it into 2 using distance transform + watershed
+        if len(valid_cnts) == 1 and median_fly_area > 0:
+            blob_area = cv2.contourArea(valid_cnts[0])
+            if blob_area > 1.5 * median_fly_area:
+                split_result = _try_split_contour(valid_cnts[0], thresh, min_area)
+                if split_result is not None:
+                    valid_cnts = split_result
 
         current_detections = []
 
@@ -334,13 +392,18 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
             row_ind, col_ind = linear_sum_assignment(dists_safe)
 
             for r, c in zip(row_ind, col_ind):
-                # Reject matches that are too far (prevent identity swaps)
-                if dists[r, c] < max_match_dist or np.isinf(dists[r, c]):
-                    # Accept match (inf means both lost — just propagate NaN)
-                    if np.isinf(dists[r, c]):
-                        assigned_dets[r] = _nan_detection()
-                    else:
-                        assigned_dets[r] = current_detections[c]
+                prev_is_lost = np.isinf(prev_pts[r][0])
+                det_is_nan = np.isnan(current_detections[c]['x']) if c < len(current_detections) else True
+
+                if prev_is_lost and det_is_nan:
+                    # Both lost — propagate NaN
+                    assigned_dets[r] = _nan_detection()
+                elif prev_is_lost and not det_is_nan:
+                    # Fly reappearing (was lost, now detected) — accept
+                    assigned_dets[r] = current_detections[c]
+                elif dists[r, c] < max_match_dist:
+                    # Normal match within distance threshold
+                    assigned_dets[r] = current_detections[c]
                 else:
                     # Distance too large — mark as lost
                     assigned_dets[r] = _nan_detection()
@@ -349,6 +412,14 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
             for i in range(n_flies):
                 if assigned_dets[i] is None:
                     assigned_dets[i] = _nan_detection()
+
+        # Update median fly area estimate (for contour splitting)
+        for d in assigned_dets:
+            if d is not None and not np.isnan(d.get('area', np.nan)):
+                recent_fly_areas.append(d['area'])
+                if len(recent_fly_areas) > 200:
+                    recent_fly_areas = recent_fly_areas[-200:]
+                median_fly_area = float(np.median(recent_fly_areas))
 
         # Update Tracks
         current_locs = []
