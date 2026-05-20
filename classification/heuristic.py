@@ -50,7 +50,179 @@ DEFAULT_PARAMS = {
     'att_cop_velocity_mm_s': 0.5,
     'att_cop_min_dur_s': 0.3,
     'merge_gap_s': 1.5,
+    'courtship_merge_gap_s': 3.0,
+    'courtship_min_dur_s': 0.5,
 }
+
+
+def _extract_overlap_mask(tracks: Dict) -> np.ndarray | None:
+    if 'overlap' not in tracks:
+        return None
+    val = tracks['overlap']
+    if isinstance(val, list):
+        if len(val) == 0:
+            return None
+        return val[0]
+    return val
+
+
+def _compute_features(tracks: Dict[str, List[np.ndarray]], fps: float,
+                      n_flies: int = 2) -> Dict:
+    """Heavy step: resolve head/tail orientation and build per-fly features.
+
+    Pure with respect to heuristic thresholds — the result can be cached and
+    reused across many calls to `_apply_rules` with different parameter sets.
+    """
+    from tracking.features import build_heuristic_features, resolve_head_tail
+
+    n_frames = len(tracks['x'][0])
+    tracks = resolve_head_tail(tracks, n_flies, fps)
+    feats = [build_heuristic_features(tracks, i, fps) for i in range(n_flies)]
+    overlap_mask = _extract_overlap_mask(tracks)
+    return {
+        'feats': feats,
+        'n_frames': n_frames,
+        'n_flies': n_flies,
+        'overlap_mask': overlap_mask,
+    }
+
+
+def _apply_rules(features: Dict, fps: float, px_per_mm: float,
+                 params: dict = None) -> Dict[str, List[List[Tuple[int, int]]]]:
+    """Cheap step: run rule thresholds against pre-computed features.
+
+    Suitable for interactive slider tuning — called many times per second."""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    feats = features['feats']
+    n_flies = features['n_flies']
+    n_frames = features['n_frames']
+    overlap_mask = features['overlap_mask']
+    merge = int(p['merge_gap_s'] * fps)
+
+    results = {
+        'WingExt': [[], []],
+        'Copulation': [[], []],
+        'Following': [[], []],
+        'Circling': [[], []],
+        'Attempted_Copulation': [[], []]
+    }
+
+    # --- Rules ---
+
+    # 1. Wing Extension
+    for i in range(n_flies):
+        wing_angle = feats[i]['wing_angle']
+        score = (wing_angle > np.radians(p['wing_ext_angle_deg'])).astype(float)
+        if overlap_mask is not None:
+            score[overlap_mask] = 0.0
+        score = smooth_score(score, fps)
+        results['WingExt'][i] = scores_to_bouts(score, min_len=int(p['wing_ext_min_dur_s'] * fps), merge_gap=merge)
+
+    # 2. Copulation
+    for i in range(n_flies):
+        c2c_mm = feats[i]['c2c'] / px_per_mm
+        vel_mm = feats[i]['vel'] / px_per_mm * fps
+
+        is_close = c2c_mm < p['cop_distance_mm']
+        is_slow = vel_mm < p['cop_velocity_mm_s']
+
+        # Rolling std dev of c2c over 2-second window
+        win = int(2.0 * fps)
+        if win < 3:
+            win = 3
+        c2c_std = pd.Series(c2c_mm).rolling(win, center=True, min_periods=1).std().fillna(0).values
+        is_stable = c2c_std < p['cop_stability_mm']
+
+        score = (is_close & is_slow & is_stable).astype(float)
+        if overlap_mask is not None:
+            score[overlap_mask] = 0.0
+        score = smooth_score(score, fps)
+        results['Copulation'][i] = scores_to_bouts(score, min_len=int(p['cop_min_dur_s'] * fps), merge_gap=merge)
+
+    # 3. Following
+    for i in range(n_flies):
+        c2c_mm = feats[i]['c2c'] / px_per_mm
+        v_par_mm = feats[i]['v_par'] / px_per_mm * fps
+        facing = np.abs(feats[i]['facing_angle'])
+
+        score = (
+            (v_par_mm > p['follow_velocity_mm_s']) &
+            (facing < np.radians(p['follow_facing_deg'])) &
+            (c2c_mm < p['follow_dist_max_mm']) &
+            (c2c_mm > p['follow_dist_min_mm'])
+        ).astype(float)
+        if overlap_mask is not None:
+            score[overlap_mask] = 0.0
+        score = smooth_score(score, fps)
+        results['Following'][i] = scores_to_bouts(score, min_len=int(p['follow_min_dur_s'] * fps), merge_gap=merge)
+
+    # 4. Circling
+    for i in range(n_flies):
+        c2c_mm = feats[i]['c2c'] / px_per_mm
+        v_perp_mm = feats[i]['v_perp'] / px_per_mm * fps
+        facing = np.abs(feats[i]['facing_angle'])
+
+        score = (
+            (np.abs(v_perp_mm) > p['circling_lat_vel_mm_s']) &
+            (c2c_mm < p['circling_dist_mm']) &
+            (facing > np.radians(45)) &
+            (facing < np.radians(135))
+        ).astype(float)
+        if overlap_mask is not None:
+            score[overlap_mask] = 0.0
+        score = smooth_score(score, fps)
+        results['Circling'][i] = scores_to_bouts(score, min_len=int(p['circling_min_dur_s'] * fps), merge_gap=merge)
+
+    # 5. Attempted Copulation
+    for i in range(n_flies):
+        n2e_mm = feats[i]['n2e'] / px_per_mm
+        vel_mm = feats[i]['vel'] / px_per_mm * fps
+
+        score = (
+            (n2e_mm < p['att_cop_nose_dist_mm']) &
+            (vel_mm > p['att_cop_velocity_mm_s'])
+        ).astype(float)
+        if overlap_mask is not None:
+            score[overlap_mask] = 0.0
+        score = smooth_score(score, fps)
+        results['Attempted_Copulation'][i] = scores_to_bouts(score, min_len=int(p['att_cop_min_dur_s'] * fps), merge_gap=merge)
+
+    # --- Mutual Exclusion (priority resolution) ---
+    # Priority: Copulation > Attempted_Copulation > Following > Circling
+    # WingExt is exempt (can co-occur with other behaviors)
+    priority_behaviors = ['Copulation', 'Attempted_Copulation', 'Following', 'Circling']
+
+    for i in range(n_flies):
+        claimed = np.zeros(n_frames, dtype=bool)
+
+        for beh in priority_behaviors:
+            filtered_bouts = []
+            for s, e in results[beh][i]:
+                bout_frames = np.arange(s, e + 1)
+                unclaimed = ~claimed[bout_frames]
+                if np.any(unclaimed):
+                    filtered_bouts.append((s, e))
+                    claimed[s:e + 1] = True
+            results[beh][i] = filtered_bouts
+
+    # --- Unified Courtship (union of all sub-behaviors per fly) ---
+    courtship_merge = int(p['courtship_merge_gap_s'] * fps)
+    courtship_min = int(p['courtship_min_dur_s'] * fps)
+    results['Courtship'] = [[], []]
+    for i in range(n_flies):
+        courtship_frames = np.zeros(n_frames, dtype=bool)
+        for beh in results:
+            if beh == 'Courtship':
+                continue
+            if i < len(results[beh]):
+                for s, e in results[beh][i]:
+                    courtship_frames[s:e + 1] = True
+        courtship_score = courtship_frames.astype(float)
+        results['Courtship'][i] = scores_to_bouts(
+            courtship_score, threshold=0.0,
+            min_len=courtship_min, merge_gap=courtship_merge)
+
+    return results
 
 
 class HeuristicClassifier:
@@ -61,150 +233,5 @@ class HeuristicClassifier:
                  params: dict = None) -> Dict[str, List[List[Tuple[int, int]]]]:
         """Returns { 'Behavior': [ [bouts_fly0], [bouts_fly1] ] }
         params: optional dict of threshold overrides (see DEFAULT_PARAMS)."""
-        p = {**DEFAULT_PARAMS, **(params or {})}
-        n_flies = 2
-        n_frames = len(tracks['x'][0])
-        merge = int(p['merge_gap_s'] * fps)
-
-        feats = [None, None]
-        from tracking.features import build_heuristic_features, resolve_head_tail
-
-        # Resolve orientation first
-        tracks = resolve_head_tail(tracks, n_flies, fps)
-
-        for i in range(n_flies):
-            feats[i] = build_heuristic_features(tracks, i, fps)
-
-        results = {
-            'WingExt': [[], []],
-            'Copulation': [[], []],
-            'Following': [[], []],
-            'Circling': [[], []],
-            'Attempted_Copulation': [[], []]
-        }
-
-        # Check for overlap flag from tracker (zero out scores during overlaps)
-        has_overlap = 'overlap' in tracks and len(tracks['overlap']) > 0
-        overlap_mask = None
-        if has_overlap:
-            overlap_mask = tracks['overlap'][0] if isinstance(tracks['overlap'], list) else tracks['overlap']
-
-        # --- Rules ---
-
-        # 1. Wing Extension
-        for i in range(n_flies):
-            wing_angle = feats[i]['wing_angle']
-            score = (wing_angle > np.radians(p['wing_ext_angle_deg'])).astype(float)
-            if overlap_mask is not None:
-                score[overlap_mask] = 0.0
-            score = smooth_score(score, fps)
-            results['WingExt'][i] = scores_to_bouts(score, min_len=int(p['wing_ext_min_dur_s'] * fps), merge_gap=merge)
-
-        # 2. Copulation
-        for i in range(n_flies):
-            c2c_mm = feats[i]['c2c'] / px_per_mm
-            vel_mm = feats[i]['vel'] / px_per_mm * fps
-
-            is_close = c2c_mm < p['cop_distance_mm']
-            is_slow = vel_mm < p['cop_velocity_mm_s']
-
-            # Rolling std dev of c2c over 2-second window
-            win = int(2.0 * fps)
-            if win < 3:
-                win = 3
-            c2c_std = pd.Series(c2c_mm).rolling(win, center=True, min_periods=1).std().fillna(0).values
-            is_stable = c2c_std < p['cop_stability_mm']
-
-            score = (is_close & is_slow & is_stable).astype(float)
-            if overlap_mask is not None:
-                score[overlap_mask] = 0.0
-            score = smooth_score(score, fps)
-            results['Copulation'][i] = scores_to_bouts(score, min_len=int(p['cop_min_dur_s'] * fps), merge_gap=merge)
-
-        # 3. Following
-        for i in range(n_flies):
-            c2c_mm = feats[i]['c2c'] / px_per_mm
-            v_par_mm = feats[i]['v_par'] / px_per_mm * fps
-            facing = np.abs(feats[i]['facing_angle'])
-
-            score = (
-                (v_par_mm > p['follow_velocity_mm_s']) &
-                (facing < np.radians(p['follow_facing_deg'])) &
-                (c2c_mm < p['follow_dist_max_mm']) &
-                (c2c_mm > p['follow_dist_min_mm'])
-            ).astype(float)
-            if overlap_mask is not None:
-                score[overlap_mask] = 0.0
-            score = smooth_score(score, fps)
-            results['Following'][i] = scores_to_bouts(score, min_len=int(p['follow_min_dur_s'] * fps), merge_gap=merge)
-
-        # 4. Circling
-        for i in range(n_flies):
-            c2c_mm = feats[i]['c2c'] / px_per_mm
-            v_perp_mm = feats[i]['v_perp'] / px_per_mm * fps
-            facing = np.abs(feats[i]['facing_angle'])
-
-            score = (
-                (np.abs(v_perp_mm) > p['circling_lat_vel_mm_s']) &
-                (c2c_mm < p['circling_dist_mm']) &
-                (facing > np.radians(45)) &
-                (facing < np.radians(135))
-            ).astype(float)
-            if overlap_mask is not None:
-                score[overlap_mask] = 0.0
-            score = smooth_score(score, fps)
-            results['Circling'][i] = scores_to_bouts(score, min_len=int(p['circling_min_dur_s'] * fps), merge_gap=merge)
-
-        # 5. Attempted Copulation
-        for i in range(n_flies):
-            n2e_mm = feats[i]['n2e'] / px_per_mm
-            vel_mm = feats[i]['vel'] / px_per_mm * fps
-
-            score = (
-                (n2e_mm < p['att_cop_nose_dist_mm']) &
-                (vel_mm > p['att_cop_velocity_mm_s'])
-            ).astype(float)
-            if overlap_mask is not None:
-                score[overlap_mask] = 0.0
-            score = smooth_score(score, fps)
-            results['Attempted_Copulation'][i] = scores_to_bouts(score, min_len=int(p['att_cop_min_dur_s'] * fps), merge_gap=merge)
-
-        # --- Mutual Exclusion (priority resolution) ---
-        # Priority: Copulation > Attempted_Copulation > Following > Circling
-        # WingExt is exempt (can co-occur with other behaviors)
-        priority_behaviors = ['Copulation', 'Attempted_Copulation', 'Following', 'Circling']
-
-        for i in range(n_flies):
-            # Build a frame-level mask of which behavior "owns" each frame
-            claimed = np.zeros(n_frames, dtype=bool)
-
-            for beh in priority_behaviors:
-                filtered_bouts = []
-                for s, e in results[beh][i]:
-                    # Check if any frame in this bout is already claimed by higher priority
-                    bout_frames = np.arange(s, e + 1)
-                    unclaimed = ~claimed[bout_frames]
-                    if np.any(unclaimed):
-                        # Keep the bout but mark its frames as claimed
-                        filtered_bouts.append((s, e))
-                        claimed[s:e + 1] = True
-                results[beh][i] = filtered_bouts
-
-        # --- Unified Courtship (union of all sub-behaviors per fly) ---
-        courtship_merge = int(p.get('courtship_merge_gap_s', 3.0) * fps)
-        courtship_min = int(p.get('courtship_min_dur_s', 0.5) * fps)
-        results['Courtship'] = [[], []]
-        for i in range(n_flies):
-            courtship_frames = np.zeros(n_frames, dtype=bool)
-            for beh in results:
-                if beh == 'Courtship':
-                    continue
-                if i < len(results[beh]):
-                    for s, e in results[beh][i]:
-                        courtship_frames[s:e+1] = True
-            courtship_score = courtship_frames.astype(float)
-            results['Courtship'][i] = scores_to_bouts(
-                courtship_score, threshold=0.0,
-                min_len=courtship_min, merge_gap=courtship_merge)
-
-        return results
+        features = _compute_features(tracks, fps)
+        return _apply_rules(features, fps, px_per_mm, params)

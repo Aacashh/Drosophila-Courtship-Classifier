@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import linear_sum_assignment
 
 @dataclass
 class TrackedFrame:
@@ -172,34 +173,50 @@ def _try_split_contour(contour, thresh_img: np.ndarray, min_area: float) -> Opti
     return None
 
 
-def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.ndarray]]:
+def track_two_flies(video_path: Path, n_flies: int = 2,
+                    segmentation_mode: str = "hybrid",
+                    buffer_seconds: float = 50.0) -> Tuple[Dict[str, List[np.ndarray]], float]:
     """
     Track flies in a cropped chamber video.
-    Returns a dictionary of per-frame arrays for features:
-    x, y, theta, a, b, area, wing_angle, overlap.
+    Returns (tracks, fps) where tracks is a dictionary of per-frame arrays
+    for features: x, y, theta, a, b, area, wing_angle, overlap.
+
+    segmentation_mode: "mog2" | "median" | "hybrid" (default "hybrid")
+    buffer_seconds: temporal window for adaptive median background (default 50s)
     """
+    from .background import AdaptiveMedianBackground
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Max distance threshold for identity assignment (25% of chamber dimension)
     max_match_dist = 0.25 * min(width, height)
 
-    fgbg = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=20, detectShadows=False)
+    # --- Background models based on segmentation mode ---
+    bg_model = None
+    if segmentation_mode in ("median", "hybrid"):
+        bg_model = AdaptiveMedianBackground(
+            (height, width), buffer_seconds=buffer_seconds, sample_hz=1.0)
+        bg_model.warmup(cap, fps)
 
-    tracks = {
-        'x': [[] for _ in range(n_flies)],
-        'y': [[] for _ in range(n_flies)],
-        'theta': [[] for _ in range(n_flies)],
-        'a': [[] for _ in range(n_flies)],
-        'b': [[] for _ in range(n_flies)],
-        'area': [[] for _ in range(n_flies)],
-        'wing_angle': [[] for _ in range(n_flies)]
-    }
+    fgbg = (cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=20,
+                                               detectShadows=False)
+            if segmentation_mode in ("mog2", "hybrid") else None)
+
+    # Pre-allocate track arrays if frame count is known
+    _track_keys = ['x', 'y', 'theta', 'a', 'b', 'area', 'wing_angle']
+    use_preallocated = n_total_frames > 0
+    if use_preallocated:
+        tracks = {k: [np.full(n_total_frames, np.nan, dtype=np.float32)
+                       for _ in range(n_flies)] for k in _track_keys}
+    else:
+        tracks = {k: [[] for _ in range(n_flies)] for k in _track_keys}
 
     prev_locs = None
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -218,9 +235,17 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # 1. Segmentation
-        fgmask = fgbg.apply(gray)
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel_open)
+        # 1. Segmentation — primary mask, with median as fallback
+        if bg_model is not None:
+            bg_model.update(gray, frame_idx, fps)
+
+        if fgbg is not None:
+            fgmask = fgbg.apply(gray)
+            fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel_open)
+        elif bg_model is not None:
+            fgmask = bg_model.foreground(gray)
+        else:
+            fgmask = np.zeros((height, width), dtype=np.uint8)
         fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel_close)
 
         _, thresh = cv2.threshold(fgmask, 127, 255, cv2.THRESH_BINARY)
@@ -241,6 +266,53 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
                 if split_result is not None:
                     valid_cnts = split_result
 
+        # --- Local re-detection on dropout ---
+        # If fewer contours than expected and we had valid tracks last frame,
+        # search a local ROI around each missing fly's last position.
+        if len(valid_cnts) < n_flies and prev_locs is not None:
+            cached_bg = bg_model.background() if bg_model is not None else None
+            for pi, (px_loc, py_loc) in enumerate(prev_locs):
+                if np.isinf(px_loc):
+                    continue
+                if len(valid_cnts) >= n_flies:
+                    break
+                # Check if we already have a contour near this position
+                body_len = max(20, int(3 * median_fly_area**0.5)) if median_fly_area > 0 else 40
+                already_found = False
+                for c in valid_cnts:
+                    dist_to_cnt = cv2.pointPolygonTest(c, (float(px_loc), float(py_loc)), True)
+                    if dist_to_cnt > -body_len:
+                        already_found = True
+                        break
+                if already_found:
+                    continue
+                # Search ROI around prior centroid
+                rx1 = max(0, int(px_loc - body_len))
+                ry1 = max(0, int(py_loc - body_len))
+                rx2 = min(width, int(px_loc + body_len))
+                ry2 = min(height, int(py_loc + body_len))
+                if rx2 <= rx1 or ry2 <= ry1:
+                    continue
+                roi_fg = fgmask[ry1:ry2, rx1:rx2].copy()
+                # Try lower threshold on median-diff if available
+                if cached_bg is not None:
+                    roi_gray = gray[ry1:ry2, rx1:rx2]
+                    roi_bg = cached_bg[ry1:ry2, rx1:rx2]
+                    roi_diff = cv2.absdiff(roi_gray, roi_bg)
+                    diff_max = int(roi_diff.max())
+                    if diff_max > 5:
+                        _, roi_mask = cv2.threshold(
+                            roi_diff, max(5, int(diff_max * 0.3)), 255, cv2.THRESH_BINARY)
+                        roi_fg = cv2.bitwise_or(roi_fg, roi_mask)
+                _, roi_t = cv2.threshold(roi_fg, 127, 255, cv2.THRESH_BINARY)
+                roi_cnts, _ = cv2.findContours(roi_t, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for rc in roi_cnts:
+                    if cv2.contourArea(rc) > min_area * 0.5:
+                        rc_offset = rc + np.array([[[rx1, ry1]]])
+                        valid_cnts.append(rc_offset)
+                        break
+            valid_cnts = sorted(valid_cnts, key=cv2.contourArea, reverse=True)[:n_flies]
+
         current_detections = []
 
         for c in valid_cnts:
@@ -260,6 +332,12 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
 
             if ma > MA:
                 ma, MA = MA, ma
+
+            # Guard against degenerate ellipse fits
+            if (not np.isfinite(cx) or not np.isfinite(cy) or
+                    ma <= 0 or MA <= 0 or not np.isfinite(ma) or not np.isfinite(MA)):
+                # Skip this contour entirely — treat as failed detection
+                continue
 
             # --- Pixel Mass Orientation Check ---
             # Project thresholded pixels along body axis instead of warpAffine
@@ -387,7 +465,6 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
                     else:
                         dists[i, j] = np.hypot(px - cx_j, py - cy_j)
 
-            from scipy.optimize import linear_sum_assignment
             dists_safe = np.where(np.isinf(dists), 1e6, dists)
             row_ind, col_ind = linear_sum_assignment(dists_safe)
 
@@ -425,8 +502,12 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
         current_locs = []
         for i in range(n_flies):
             d = assigned_dets[i]
-            for key in ['x', 'y', 'theta', 'a', 'b', 'area', 'wing_angle']:
-                tracks[key][i].append(d.get(key, np.nan))
+            if use_preallocated:
+                for key in _track_keys:
+                    tracks[key][i][frame_idx] = d.get(key, np.nan)
+            else:
+                for key in _track_keys:
+                    tracks[key][i].append(d.get(key, np.nan))
 
             # Keep last known position for matching (don't use inf for lost flies)
             if not np.isnan(d['x']):
@@ -443,10 +524,15 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
 
     cap.release()
 
-    # Convert to numpy arrays
+    # Convert to numpy arrays (or trim pre-allocated arrays)
     final_tracks = {}
-    for k in tracks:
-        final_tracks[k] = [np.array(t, dtype=np.float32) for t in tracks[k]]
+    if use_preallocated:
+        # Trim to actual frame count if video had fewer frames than reported
+        for k in _track_keys:
+            final_tracks[k] = [t[:frame_idx] for t in tracks[k]]
+    else:
+        for k in tracks:
+            final_tracks[k] = [np.array(t, dtype=np.float32) for t in tracks[k]]
 
     # Post-processing: interpolate short NaN gaps
     final_tracks = interpolate_short_gaps(final_tracks, max_gap=5)
@@ -458,4 +544,4 @@ def track_two_flies(video_path: Path, n_flies: int = 2) -> Dict[str, List[np.nda
     overlap = compute_overlap_flags(final_tracks, n_flies)
     final_tracks['overlap'] = [overlap]
 
-    return final_tracks
+    return final_tracks, fps

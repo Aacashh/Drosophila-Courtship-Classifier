@@ -8,18 +8,11 @@ import time
 import datetime
 import json
 import gc
-import concurrent.futures
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import io
 from PIL import Image
-
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except ImportError:
-    _HAS_PSUTIL = False
 
 from utils.video import detect_chambers, crop_video, stabilize_video, find_best_detection_frame
 from tracking.tracker import track_two_flies
@@ -82,8 +75,8 @@ def _generate_bout_gif(video_path_str, start_frame, end_frame, target_fps=10, ma
     return buf.getvalue()
 
 
-def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params=None):
-    """Worker function for parallel processing."""
+def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysis_mode, models, px_per_mm, heuristic_params=None, segmentation_mode="hybrid", buffer_seconds=50.0, save_overlay=True):
+    """Process a single chamber: crop, track, classify, export."""
     try:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -104,12 +97,8 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
                 final_video = stab_video
         
         # 3. Track
-        tracks = track_two_flies(final_video)
-        
-        # Get FPS
-        cap_temp = cv2.VideoCapture(str(final_video))
-        fps = cap_temp.get(cv2.CAP_PROP_FPS) or 30.0
-        cap_temp.release()
+        tracks, fps = track_two_flies(final_video, segmentation_mode=segmentation_mode,
+                                      buffer_seconds=buffer_seconds)
         
         # 4. Classify
         bouts_by_behavior = {}
@@ -131,6 +120,10 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
         fly_stats = infer_sex(bouts_by_behavior, tracks=tracks)
         csv_path = output_dir / f"chamber_{i}_results.csv"
         export_to_csv(csv_path, bouts_by_behavior, fps, fly_stats)
+
+        # Persist tracks so the Compare tab can re-score interactively
+        from evaluation.tuning import save_tracks, tracks_npz_path
+        save_tracks(tracks, fps, tracks_npz_path(output_dir, i))
 
         # Export summary CSV with CI and latency
         n_frames = len(tracks['x'][0])
@@ -170,6 +163,13 @@ def process_single_chamber(i, roi, video_path, output_dir, do_stabilize, analysi
                     'Count': len(bouts),
                     'Total Duration (s)': round(duration, 2)
                 })
+
+        # 6. Save overlay video (if enabled)
+        if save_overlay:
+            from utils.overlay import save_overlay_video
+            overlay_path = output_dir / f"chamber_{i}_overlay.mp4"
+            save_overlay_video(final_video, overlay_path, tracks,
+                               bouts_by_behavior, fly_stats, fps)
 
         # Cleanup large objects to free memory for next chamber
         del tracks, bouts_by_behavior
@@ -436,6 +436,22 @@ def _run_analysis():
     st.sidebar.subheader("Parameters")
     px_per_mm = st.sidebar.number_input("Pixels per mm (Calibration)", value=15.0, min_value=1.0)
 
+    with st.sidebar.expander("Tracking Backend"):
+        segmentation_mode = st.selectbox(
+            "Segmentation Mode",
+            ["hybrid", "mog2", "median"],
+            index=0,
+            key="seg_mode",
+            help="hybrid = MOG2 + adaptive median (best for stationary flies)"
+        )
+        buffer_duration = st.number_input(
+            "Median Buffer (seconds)", value=50.0,
+            min_value=10.0, max_value=120.0, step=5.0, key="buf_dur",
+            help="Temporal window for median background model"
+        )
+        save_overlay = st.checkbox("Save overlay videos", value=True, key="save_overlay",
+                                   help="Save annotated videos with tracking ellipses and behavior labels")
+
     # --- Heuristic Threshold Controls ---
     heuristic_params = None
     if analysis_mode == "Heuristic (Built-in Rules)":
@@ -538,11 +554,8 @@ def _run_analysis():
                 st.rerun()
 
             # Display current ROIs on the detection frame (not first frame)
-            frame_viz = st.session_state.detection_frame.copy()
-            for i, (x, y, w, h) in enumerate(st.session_state.rois):
-                cv2.rectangle(frame_viz, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                cv2.putText(frame_viz, f"#{i}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
+            from utils.overlay import draw_chamber_overlay
+            frame_viz = draw_chamber_overlay(st.session_state.detection_frame, st.session_state.rois)
             st.image(cv2.cvtColor(frame_viz, cv2.COLOR_BGR2RGB), caption="Detected Chambers", use_container_width=True)
             
         with col2:
@@ -593,7 +606,7 @@ def _run_analysis():
 
         # --- Step 2: Processing ---
         st.subheader("2. Analysis")
-        do_stabilize = st.checkbox("Enable Stabilization (Slower)", value=True)
+        do_stabilize = st.checkbox("Enable Stabilization (Slower)", value=False)
         
         # Chamber Selection
         st.write("### Select Chambers to Process")
@@ -660,15 +673,6 @@ def _run_analysis():
             st.subheader("3. Real-time Results")
             results_container = st.container()
             
-            # --- RAM-aware worker count ---
-            if _HAS_PSUTIL:
-                avail_gb = psutil.virtual_memory().available / (1024 ** 3)
-                max_by_ram = max(1, int(avail_gb / 0.5))
-                max_workers = min(max_by_ram, len(selected_indices), 4)
-            else:
-                max_workers = min(2, len(selected_indices))
-            status_text.text(f"Using {max_workers} parallel worker(s)...")
-
             # --- Resume: skip already-completed chambers ---
             progress_file = output_dir / "_progress.json"
             completed_chambers = set()
@@ -708,54 +712,41 @@ def _run_analysis():
             if completed > 0:
                 progress_bar.progress(completed / total_to_process)
 
-            CHAMBER_TIMEOUT = 600  # 10 minutes per chamber
+            # --- Sequential processing (lower memory, no pickling overhead) ---
+            for i in chambers_to_run:
+                roi = st.session_state.rois[i]
+                status_text.text(f"Processing Chamber {i} ({completed + 1}/{total_to_process})...")
+                try:
+                    idx, success, result_path, summary = process_single_chamber(
+                        i, roi, video_path, output_dir, do_stabilize,
+                        analysis_mode, models, px_per_mm, heuristic_params,
+                        segmentation_mode, buffer_duration, save_overlay
+                    )
+                except Exception as e:
+                    st.error(f"Chamber {i}: {e}")
+                    completed += 1
+                    progress_bar.progress(completed / total_to_process)
+                    continue
 
-            if chambers_to_run:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_idx = {}
-                    for i in chambers_to_run:
-                        roi = st.session_state.rois[i]
-                        f = executor.submit(
-                            process_single_chamber, i, roi, video_path,
-                            output_dir, do_stabilize, analysis_mode, models,
-                            px_per_mm, heuristic_params
-                        )
-                        future_to_idx[f] = i
+                completed += 1
+                progress_bar.progress(completed / total_to_process)
 
-                    for future in concurrent.futures.as_completed(future_to_idx):
-                        chamber_idx = future_to_idx[future]
-                        try:
-                            i, success, result_path, summary = future.result(timeout=CHAMBER_TIMEOUT)
-                        except concurrent.futures.TimeoutError:
-                            st.warning(f"Chamber {chamber_idx} timed out after {CHAMBER_TIMEOUT}s — skipping")
-                            completed += 1
-                            progress_bar.progress(completed / total_to_process)
-                            continue
-                        except (concurrent.futures.BrokenExecutor, Exception) as e:
-                            st.error(f"Chamber {chamber_idx} worker crashed: {e}")
-                            completed += 1
-                            progress_bar.progress(completed / total_to_process)
-                            continue
+                if success:
+                    status_text.text(f"Finished Chamber {idx} ({completed}/{total_to_process})")
+                    all_summaries.extend(summary)
 
-                        completed += 1
-                        progress_bar.progress(completed / total_to_process)
+                    # Save progress incrementally
+                    completed_chambers.add(idx)
+                    try:
+                        progress_file.write_text(json.dumps(sorted(completed_chambers)))
+                    except Exception:
+                        pass
 
-                        if success:
-                            status_text.text(f"Finished Chamber {i} ({completed}/{total_to_process})")
-                            all_summaries.extend(summary)
-
-                            # Save progress incrementally
-                            completed_chambers.add(i)
-                            try:
-                                progress_file.write_text(json.dumps(sorted(completed_chambers)))
-                            except Exception:
-                                pass
-
-                            if all_summaries:
-                                df = pd.DataFrame(all_summaries)
-                                results_container.dataframe(df, use_container_width=True)
-                        else:
-                            st.error(f"Error in Chamber {i}: {result_path}")
+                    if all_summaries:
+                        df = pd.DataFrame(all_summaries)
+                        results_container.dataframe(df, use_container_width=True)
+                else:
+                    st.error(f"Error in Chamber {idx}: {result_path}")
                 
             status_text.text("Analysis Complete!")
             st.session_state._analysis_output_dir = str(output_dir.resolve())
@@ -802,13 +793,23 @@ def main():
     4. Download Results
     """)
 
-    tab_analysis, tab_verify = st.tabs(["Analysis", "Verification"])
+    tab_analysis, tab_verify, tab_chambers, tab_compare = st.tabs(
+        ["Analysis", "Verification", "Chamber Map", "Compare to Reference"]
+    )
 
     with tab_analysis:
         _run_analysis()
 
     with tab_verify:
         verification_viewer()
+
+    with tab_chambers:
+        from evaluation.ui_verify import render_verify_tab
+        render_verify_tab()
+
+    with tab_compare:
+        from evaluation.ui_compare import render_compare_tab
+        render_compare_tab()
 
 
 if __name__ == "__main__":
